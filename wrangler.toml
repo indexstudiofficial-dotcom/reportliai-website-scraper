@@ -1,3 +1,3 @@
-name = "website-scraper-worker"
+name = "reportliai-website-scraper"
 main = "src/index.js"
 compatibility_date = "2026-09-24"
