@@ -1,8 +1,12 @@
 // ============================================================
-// WEBSITE BUSINESS KNOWLEDGE EXTRACTOR
-// Cloudflare Worker + Supabase + Sarvam 105B
+// REPORTLI AI
+// WEBSITE KNOWLEDGE EXTRACTOR
+//
+// CLOUDFLARE WORKER
+// SUPABASE + SARVAM 105B
 //
 // ENVIRONMENT VARIABLES:
+//
 // SUPABASE_URL
 // SUPABASE_SECRET_KEY
 // SARVAM_API_KEY
@@ -12,20 +16,10 @@
 // {
 //   "application_id": "app-123",
 //   "domain": "https://example.com",
-//   "max_pages": 10,
+//   "max_pages": 5,
 //   "page_offset": 0
 // }
 //
-// The Worker:
-// 1. Finds internal website pages
-// 2. Downloads each page
-// 3. Removes useless HTML
-// 4. Extracts readable content
-// 5. Sends content to Sarvam 105B
-// 6. Sarvam identifies meaningful fields automatically
-// 7. Worker validates the response
-// 8. Worker saves fields to business_data
-// 9. Returns page_offset for the next batch
 // ============================================================
 
 
@@ -34,37 +28,60 @@
 // ============================================================
 
 const CONFIG = {
-  // Maximum pages processed in one invocation by default.
-  // 10 is safer for Cloudflare Free because every page
-  // can require multiple external requests.
-  DEFAULT_MAX_PAGES: 10,
 
-  // Hard safety maximum supplied by the user.
-  MAX_ALLOWED_PAGES: 40,
+  // ----------------------------------------------------------
+  // How many pages to process in one Worker request
+  // ----------------------------------------------------------
 
-  // Maximum HTML downloaded from one webpage.
+  DEFAULT_MAX_PAGES: 5,
+
+  MAX_PAGES_PER_REQUEST: 10,
+
+
+  // ----------------------------------------------------------
+  // Website limits
+  // ----------------------------------------------------------
+
   MAX_HTML_BYTES: 2_000_000,
 
-  // Maximum text sent to Sarvam in one extraction request.
-  MAX_CHUNK_CHARS: 30_000,
-
-  // Maximum number of chunks allowed from one page.
-  MAX_CHUNKS_PER_PAGE: 8,
-
-  // Maximum sitemap files we follow.
-  MAX_SITEMAPS: 20,
-
-  // Maximum URLs collected from sitemaps.
   MAX_DISCOVERED_URLS: 500,
 
-  // Request timeout.
-  FETCH_TIMEOUT_MS: 15_000,
+  MAX_SITEMAPS: 20,
 
-  // Sarvam endpoint.
-  SARVAM_URL: "https://api.sarvam.ai/v1/chat/completions",
 
-  // Sarvam model.
-  SARVAM_MODEL: "sarvam-105b"
+  // ----------------------------------------------------------
+  // IMPORTANT:
+  //
+  // Do NOT send an entire webpage to Sarvam.
+  //
+  // Smaller chunks make extraction much more reliable.
+  // ----------------------------------------------------------
+
+  CHUNK_SIZE: 6000,
+
+  CHUNK_OVERLAP: 500,
+
+  MAX_CHUNKS_PER_PAGE: 50,
+
+
+  // ----------------------------------------------------------
+  // Request timeout
+  // ----------------------------------------------------------
+
+  WEBSITE_TIMEOUT: 15000,
+
+  SARVAM_TIMEOUT: 60000,
+
+
+  // ----------------------------------------------------------
+  // Sarvam
+  // ----------------------------------------------------------
+
+  SARVAM_URL:
+    "https://api.sarvam.ai/v1/chat/completions",
+
+  SARVAM_MODEL:
+    "sarvam-105b"
 };
 
 
@@ -73,23 +90,29 @@ const CONFIG = {
 // ============================================================
 
 export default {
-  async fetch(request, env, ctx) {
+
+  async fetch(request, env) {
+
     // --------------------------------------------------------
     // CORS
     // --------------------------------------------------------
 
     if (request.method === "OPTIONS") {
+
       return new Response(null, {
         status: 204,
         headers: corsHeaders()
       });
+
     }
 
+
     // --------------------------------------------------------
-    // Only POST is supported
+    // POST ONLY
     // --------------------------------------------------------
 
     if (request.method !== "POST") {
+
       return jsonResponse(
         {
           success: false,
@@ -97,242 +120,368 @@ export default {
         },
         405
       );
+
     }
 
+
     try {
-      // ------------------------------------------------------
-      // Validate environment variables
-      // ------------------------------------------------------
+
+      // ======================================================
+      // CHECK ENVIRONMENT
+      // ======================================================
 
       if (!env.SUPABASE_URL) {
-        throw new Error("SUPABASE_URL secret is missing.");
+
+        throw new Error(
+          "SUPABASE_URL secret is missing."
+        );
+
       }
 
       if (!env.SUPABASE_SECRET_KEY) {
-        throw new Error("SUPABASE_SECRET_KEY secret is missing.");
+
+        throw new Error(
+          "SUPABASE_SECRET_KEY secret is missing."
+        );
+
       }
 
       if (!env.SARVAM_API_KEY) {
-        throw new Error("SARVAM_API_KEY secret is missing.");
+
+        throw new Error(
+          "SARVAM_API_KEY secret is missing."
+        );
+
       }
 
-      // ------------------------------------------------------
-      // Parse request
-      // ------------------------------------------------------
 
-      const body = await request.json();
+      // ======================================================
+      // READ BODY
+      // ======================================================
+
+      const body =
+        await request.json();
+
 
       const applicationId =
         body.application_id ||
         body.applicationId;
 
-      const websiteUrl =
+
+      const websiteInput =
         body.domain ||
         body.website_url ||
         body.websiteUrl;
 
+
       if (!applicationId) {
+
         return jsonResponse(
           {
             success: false,
-            error: "application_id is required."
+            error:
+              "application_id is required."
           },
           400
         );
+
       }
 
-      if (!websiteUrl) {
+
+      if (!websiteInput) {
+
         return jsonResponse(
           {
             success: false,
-            error: "domain or website_url is required."
+            error:
+              "domain or website_url is required."
           },
           400
         );
+
       }
 
-      // ------------------------------------------------------
-      // Page batch settings
-      // ------------------------------------------------------
+
+      // ======================================================
+      // PAGE BATCH
+      // ======================================================
 
       let maxPages =
         Number(body.max_pages) ||
         CONFIG.DEFAULT_MAX_PAGES;
 
-      maxPages = Math.max(
-        1,
-        Math.min(maxPages, CONFIG.MAX_ALLOWED_PAGES)
-      );
+
+      maxPages =
+        Math.max(
+          1,
+          Math.min(
+            maxPages,
+            CONFIG.MAX_PAGES_PER_REQUEST
+          )
+        );
+
 
       let pageOffset =
         Number(body.page_offset) || 0;
 
-      pageOffset = Math.max(0, pageOffset);
 
-      // ------------------------------------------------------
-      // Normalize website
-      // ------------------------------------------------------
+      pageOffset =
+        Math.max(
+          0,
+          pageOffset
+        );
 
-      const baseUrl = normalizeWebsiteUrl(websiteUrl);
 
-      // ------------------------------------------------------
-      // Verify application belongs to a user/application
-      // ------------------------------------------------------
+      // ======================================================
+      // NORMALIZE WEBSITE
+      // ======================================================
 
-      const application = await getApplication(
-        env,
-        applicationId
-      );
+      const websiteUrl =
+        normalizeWebsiteUrl(
+          websiteInput
+        );
+
+
+      // ======================================================
+      // VERIFY APPLICATION
+      // ======================================================
+
+      const application =
+        await getApplication(
+          env,
+          applicationId
+        );
+
 
       if (!application) {
+
         return jsonResponse(
           {
             success: false,
-            error: "Application not found."
+            error:
+              "Application not found."
           },
           404
         );
+
       }
 
-      // ------------------------------------------------------
-      // Discover website pages
-      // ------------------------------------------------------
 
-      const discovered = await discoverWebsitePages(
-        baseUrl
-      );
+      // ======================================================
+      // DISCOVER PAGES
+      // ======================================================
 
-      const allPages = discovered.urls;
+      const discovery =
+        await discoverPages(
+          websiteUrl
+        );
 
-      // ------------------------------------------------------
-      // Select current batch
-      // ------------------------------------------------------
 
-      const pages = allPages.slice(
-        pageOffset,
-        pageOffset + maxPages
-      );
+      const allPages =
+        discovery.urls;
 
-      // ------------------------------------------------------
-      // Processing statistics
-      // ------------------------------------------------------
+
+      // ======================================================
+      // SELECT CURRENT BATCH
+      // ======================================================
+
+      const pages =
+        allPages.slice(
+          pageOffset,
+          pageOffset + maxPages
+        );
+
+
+      // ======================================================
+      // STATS
+      // ======================================================
 
       const stats = {
-        pages_discovered: allPages.length,
-        pages_selected: pages.length,
-        pages_processed: 0,
-        pages_failed: 0,
-        chunks_processed: 0,
-        fields_extracted: 0,
-        fields_saved: 0,
-        fields_failed: 0
+
+        pages_discovered:
+          allPages.length,
+
+        pages_selected:
+          pages.length,
+
+        pages_processed:
+          0,
+
+        pages_failed:
+          0,
+
+        chunks_sent_to_ai:
+          0,
+
+        fields_extracted:
+          0,
+
+        fields_saved:
+          0,
+
+        fields_failed:
+          0,
+
+        sarvam_errors:
+          0
+
       };
+
 
       const pageResults = [];
 
-      // ------------------------------------------------------
-      // Process pages sequentially
-      //
-      // Sequential processing is intentional.
-      // It prevents a large number of simultaneous
-      // website/Sarvam/Supabase requests.
-      // ------------------------------------------------------
+
+      // ======================================================
+      // PROCESS EACH PAGE
+      // ======================================================
 
       for (const pageUrl of pages) {
+
         try {
-          const result = await processPage(
-            env,
-            applicationId,
-            pageUrl
-          );
+
+          const result =
+            await processPage(
+              env,
+              applicationId,
+              pageUrl
+            );
+
 
           stats.pages_processed++;
 
-          stats.chunks_processed +=
-            result.chunks_processed;
+
+          stats.chunks_sent_to_ai +=
+            result.chunks_sent_to_ai;
+
 
           stats.fields_extracted +=
             result.fields_extracted;
 
+
           stats.fields_saved +=
             result.fields_saved;
+
 
           stats.fields_failed +=
             result.fields_failed;
 
+
+          stats.sarvam_errors +=
+            result.sarvam_errors;
+
+
           pageResults.push({
+
             url: pageUrl,
+
             success: true,
+
             ...result
+
           });
+
 
         } catch (error) {
+
           stats.pages_failed++;
 
+
           pageResults.push({
+
             url: pageUrl,
+
             success: false,
-            error: error.message
+
+            error:
+              error.message
+
           });
+
         }
+
       }
 
-      // ------------------------------------------------------
-      // Calculate next batch
-      // ------------------------------------------------------
+
+      // ======================================================
+      // PAGINATION
+      // ======================================================
 
       const nextOffset =
-        pageOffset + pages.length;
+        pageOffset +
+        pages.length;
 
-      const hasMorePages =
-        nextOffset < allPages.length;
 
-      // ------------------------------------------------------
-      // Response
-      // ------------------------------------------------------
+      const hasMore =
+        nextOffset <
+        allPages.length;
+
+
+      // ======================================================
+      // RESPONSE
+      // ======================================================
 
       return jsonResponse({
+
         success: true,
 
-        application_id: applicationId,
+        application_id:
+          applicationId,
 
-        website: baseUrl,
+        website:
+          websiteUrl,
 
         stats,
 
         pagination: {
-          page_offset: pageOffset,
-          next_offset: hasMorePages
-            ? nextOffset
-            : null,
 
-          has_more_pages: hasMorePages,
+          page_offset:
+            pageOffset,
 
-          total_pages: allPages.length
+          next_offset:
+            hasMore
+              ? nextOffset
+              : null,
+
+          has_more_pages:
+            hasMore,
+
+          total_pages:
+            allPages.length
+
         },
 
-        page_results: pageResults,
+        page_results:
+          pageResults,
 
-        message: hasMorePages
-          ? `Batch completed. Process the next batch using page_offset=${nextOffset}.`
-          : "All discovered pages have been processed."
+        message:
+          hasMore
+            ? `Batch completed. Continue with page_offset=${nextOffset}.`
+            : "All discovered pages processed."
+
       });
 
+
     } catch (error) {
+
       console.error(
         "WORKER_ERROR",
-        error.message
+        error
       );
+
 
       return jsonResponse(
         {
           success: false,
-          error: error.message
+          error:
+            error.message
         },
         500
       );
+
     }
+
   }
+
 };
 
 
@@ -345,590 +494,789 @@ async function processPage(
   applicationId,
   pageUrl
 ) {
-  // ----------------------------------------------------------
-  // Download page
-  // ----------------------------------------------------------
 
-  const response = await fetchWithTimeout(
-    pageUrl,
-    {
-      method: "GET",
-      headers: {
-        "User-Agent":
-          "ReportliAI-WebsiteKnowledgeBot/1.0",
-        "Accept":
-          "text/html,application/xhtml+xml"
-      }
-    },
-    CONFIG.FETCH_TIMEOUT_MS
-  );
+
+  // ==========================================================
+  // DOWNLOAD PAGE
+  // ==========================================================
+
+  const response =
+    await fetchWithTimeout(
+      pageUrl,
+      {
+        method: "GET",
+
+        headers: {
+
+          "User-Agent":
+            "ReportliAI-KnowledgeBot/1.0",
+
+          "Accept":
+            "text/html,application/xhtml+xml"
+
+        }
+      },
+      CONFIG.WEBSITE_TIMEOUT
+    );
+
 
   if (!response.ok) {
+
     throw new Error(
-      `Website returned HTTP ${response.status}`
+      `Page returned HTTP ${response.status}`
     );
+
   }
 
-  // ----------------------------------------------------------
-  // Check content type
-  // ----------------------------------------------------------
+
+  // ==========================================================
+  // CHECK CONTENT TYPE
+  // ==========================================================
 
   const contentType =
-    response.headers.get("content-type") || "";
+    response.headers.get(
+      "content-type"
+    ) || "";
+
 
   if (
     !contentType.includes("text/html") &&
-    !contentType.includes("application/xhtml+xml")
+    !contentType.includes(
+      "application/xhtml+xml"
+    )
   ) {
+
     throw new Error(
-      `Not an HTML page. Content-Type: ${contentType}`
+      `Not an HTML page: ${contentType}`
     );
+
   }
 
-  // ----------------------------------------------------------
-  // Read HTML
-  // ----------------------------------------------------------
 
-  const html = await readLimitedText(
-    response,
-    CONFIG.MAX_HTML_BYTES
-  );
+  // ==========================================================
+  // READ HTML
+  // ==========================================================
 
-  // ----------------------------------------------------------
-  // Clean HTML
-  // ----------------------------------------------------------
-
-  const cleaned = extractReadablePage(html);
-
-  if (!cleaned.text.trim()) {
-    throw new Error(
-      "No readable text found on page."
+  const html =
+    await readLimitedText(
+      response,
+      CONFIG.MAX_HTML_BYTES
     );
+
+
+  // ==========================================================
+  // CLEAN HTML
+  // ==========================================================
+
+  const page =
+    extractReadableContent(
+      html
+    );
+
+
+  if (!page.text.trim()) {
+
+    throw new Error(
+      "No readable content found."
+    );
+
   }
 
-  // ----------------------------------------------------------
-  // Split content into chunks
-  // ----------------------------------------------------------
 
-  const chunks = chunkText(
-    cleaned.text,
-    CONFIG.MAX_CHUNK_CHARS,
-    CONFIG.MAX_CHUNKS_PER_PAGE
-  );
+  // ==========================================================
+  // SPLIT PAGE INTO SMALL CHUNKS
+  // ==========================================================
 
-  // ----------------------------------------------------------
-  // Process chunks
-  // ----------------------------------------------------------
+  const chunks =
+    createChunks(
+      page.text,
+      CONFIG.CHUNK_SIZE,
+      CONFIG.CHUNK_OVERLAP
+    );
 
-  let chunksProcessed = 0;
+
+  // ==========================================================
+  // LIMIT SAFETY
+  // ==========================================================
+
+  const limitedChunks =
+    chunks.slice(
+      0,
+      CONFIG.MAX_CHUNKS_PER_PAGE
+    );
+
+
+  let chunksSent = 0;
+
   let fieldsExtracted = 0;
+
   let fieldsSaved = 0;
+
   let fieldsFailed = 0;
 
+  let sarvamErrors = 0;
+
+
+  // ==========================================================
+  // PROCESS CHUNKS ONE BY ONE
+  // ==========================================================
+
   for (
-    let chunkIndex = 0;
-    chunkIndex < chunks.length;
-    chunkIndex++
+    let index = 0;
+    index < limitedChunks.length;
+    index++
   ) {
-    const chunk = chunks[chunkIndex];
+
+    const chunk =
+      limitedChunks[index];
+
 
     try {
+
       // ------------------------------------------------------
-      // Ask Sarvam to understand the content
+      // SEND SMALL CHUNK TO SARVAM
       // ------------------------------------------------------
 
       const extracted =
-        await extractWithSarvam(
+        await extractChunkWithSarvam(
           env,
           {
-            url: pageUrl,
-            title: cleaned.title,
-            chunkIndex,
-            totalChunks: chunks.length,
-            content: chunk
+            url:
+              pageUrl,
+
+            title:
+              page.title,
+
+            chunk:
+              chunk,
+
+            chunkNumber:
+              index + 1,
+
+            totalChunks:
+              limitedChunks.length
           }
         );
 
-      chunksProcessed++;
 
-      if (
-        !extracted ||
-        !Array.isArray(extracted.fields)
-      ) {
-        continue;
-      }
+      chunksSent++;
+
 
       // ------------------------------------------------------
-      // Validate and normalize AI fields
+      // NORMALIZE FIELDS
       // ------------------------------------------------------
 
       const fields =
-        normalizeExtractedFields(
-          extracted.fields
+        normalizeFields(
+          extracted?.fields
         );
 
-      fieldsExtracted += fields.length;
+
+      fieldsExtracted +=
+        fields.length;
+
 
       // ------------------------------------------------------
-      // Save fields
+      // SAVE EACH FIELD
       // ------------------------------------------------------
 
-      for (const item of fields) {
+      for (
+        const item of fields
+      ) {
+
         try {
+
           await saveBusinessData(
             env,
+
             applicationId,
+
             item.field,
+
             item.data,
+
             pageUrl
           );
 
+
           fieldsSaved++;
 
+
         } catch (error) {
+
           fieldsFailed++;
 
+
           console.error(
-            "FIELD_SAVE_ERROR",
+            "SAVE_FIELD_ERROR",
             {
               pageUrl,
-              field: item.field,
-              error: error.message
+              field:
+                item.field,
+              error:
+                error.message
             }
           );
+
         }
+
       }
 
+
     } catch (error) {
+
+      sarvamErrors++;
+
+
       console.error(
-        "CHUNK_ERROR",
+        "SARVAM_CHUNK_ERROR",
         {
           pageUrl,
-          chunkIndex,
-          error: error.message
+          chunk:
+            index + 1,
+          error:
+            error.message
         }
       );
+
+
+      // ------------------------------------------------------
+      // IMPORTANT:
+      //
+      // One bad chunk should NOT stop the entire page.
+      // ------------------------------------------------------
+
+      continue;
+
     }
+
   }
 
+
   return {
-    chunks_processed: chunksProcessed,
-    fields_extracted: fieldsExtracted,
-    fields_saved: fieldsSaved,
-    fields_failed: fieldsFailed
+
+    chunks_sent_to_ai:
+      chunksSent,
+
+    fields_extracted:
+      fieldsExtracted,
+
+    fields_saved:
+      fieldsSaved,
+
+    fields_failed:
+      fieldsFailed,
+
+    sarvam_errors:
+      sarvamErrors
+
   };
+
 }
 
 
 // ============================================================
-// SARVAM EXTRACTION
+// SARVAM 105B EXTRACTION
 // ============================================================
 
-async function extractWithSarvam(
+async function extractChunkWithSarvam(
   env,
-  page
+  input
 ) {
-  // ----------------------------------------------------------
-  // Strong extraction instructions
-  // ----------------------------------------------------------
+
+
+  // ==========================================================
+  // SYSTEM PROMPT
+  //
+  // SHORT ON PURPOSE.
+  //
+  // We don't want a giant instruction prompt repeated
+  // for every large website page.
+  // ==========================================================
 
   const systemPrompt = `
-You are a website business knowledge extraction engine.
+You extract factual business knowledge from website text.
 
-Your job is to extract EVERY useful factual piece of
-information from the supplied website content.
+Extract EVERY useful fact actually present in the text.
 
-This information will be used by AI employees such as:
-
-- AI receptionist
-- WhatsApp agent
-- customer support agent
-- sales agent
-- appointment agent
-- Gmail agent
-
-IMPORTANT RULES:
-
-1. Extract information that is actually present.
-2. NEVER invent or guess information.
-3. Do not omit useful factual information.
-4. Create meaningful field names automatically.
-5. Field names MUST be lowercase snake_case.
-6. Field names must describe the meaning of the data.
-7. NEVER use names like:
-   section_1
-   section_2
-   text_1
-   unknown
-   data_1
-8. Prefer useful semantic names such as:
-   business_name
-   business_description
-   services
-   pricing
-   opening_hours
-   appointment_policy
-   cancellation_policy
-   payment_methods
-   address
-   phone
-   email
-   doctors
-   staff
-   facilities
-   qualifications
-   insurance
-   faq
-   products
-   product_features
-   service_area
-   parking_information
-   accessibility
-   contact_information
-   company_history
-9. If the information does not fit an existing common category,
-   create a new descriptive snake_case field.
-10. Preserve important details exactly.
-11. Keep arrays as arrays when the content contains lists.
-12. Keep objects as objects when the information naturally
-    contains multiple properties.
-13. Do not create duplicate fields unnecessarily.
-14. Combine closely related information when appropriate.
-15. Do not extract navigation menu items as business facts.
-16. Do not extract cookie banners, privacy popups, CSS,
-    JavaScript, tracking code, or unrelated website boilerplate.
-17. Do not include your own explanations.
-18. Return ONLY the requested JSON structure.
+Rules:
+- Never invent facts.
+- Never guess.
+- Use meaningful lowercase snake_case field names.
+- Do not use section_1, section_2, text_1, unknown, data_1.
+- Extract names, services, products, prices, policies, hours, locations, staff, doctors, facilities, contact details, FAQs, qualifications, payment information, appointment information, company history, service areas and other useful business facts.
+- Preserve important details.
+- If a list exists, return an array.
+- If structured information exists, return an object.
+- Ignore navigation, cookie notices, tracking text, CSS, JavaScript and generic website boilerplate.
+- Only use information contained in the supplied text.
+- Return JSON only.
 `;
+
+
+  // ==========================================================
+  // USER PROMPT
+  // ==========================================================
 
   const userPrompt = `
-WEBSITE URL:
-${page.url}
+URL:
+${input.url}
 
 PAGE TITLE:
-${page.title || ""}
+${input.title || ""}
 
-THIS IS CHUNK ${page.chunkIndex + 1}
-OF ${page.totalChunks}
+CHUNK:
+${input.chunkNumber}/${input.totalChunks}
 
-WEBSITE CONTENT:
-----------------
-${page.content}
-----------------
+CONTENT:
+${input.chunk}
 
-Extract all useful factual business knowledge from this
-content.
-
-Remember:
-- Do not invent anything.
-- Use meaningful snake_case field names.
-- Preserve the actual information.
-- Return only structured fields.
+Extract the factual business knowledge from this chunk.
 `;
 
-  // ----------------------------------------------------------
-  // Structured JSON schema
-  // ----------------------------------------------------------
+
+  // ==========================================================
+  // STRUCTURED OUTPUT
+  //
+  // Keep schema simple.
+  // The previous anyOf-heavy schema can make structured
+  // extraction unnecessarily fragile.
+  //
+  // data is returned as JSON-compatible text.
+  // We parse it ourselves before saving to jsonb.
+  // ==========================================================
 
   const responseFormat = {
-    type: "json_schema",
+
+    type:
+      "json_schema",
 
     json_schema: {
-      name: "business_knowledge",
 
-      strict: true,
+      name:
+        "business_knowledge",
+
+      strict:
+        true,
 
       description:
-        "Structured business information extracted from website content.",
+        "Business facts extracted from website content.",
 
       schema: {
-        type: "object",
 
-        additionalProperties: false,
+        type:
+          "object",
+
+        additionalProperties:
+          false,
 
         properties: {
+
           fields: {
-            type: "array",
+
+            type:
+              "array",
 
             items: {
-              type: "object",
 
-              additionalProperties: false,
+              type:
+                "object",
+
+              additionalProperties:
+                false,
 
               properties: {
+
                 field: {
-                  type: "string"
+                  type:
+                    "string"
                 },
 
                 data: {
-                  anyOf: [
-                    {
-                      type: "string"
-                    },
-                    {
-                      type: "number"
-                    },
-                    {
-                      type: "boolean"
-                    },
-                    {
-                      type: "null"
-                    },
-                    {
-                      type: "array",
-                      items: {}
-                    },
-                    {
-                      type: "object",
-                      additionalProperties: true
-                    }
-                  ]
+                  type:
+                    "string"
                 }
+
               },
 
               required: [
                 "field",
                 "data"
               ]
+
             }
+
           }
+
         },
 
         required: [
           "fields"
         ]
+
       }
+
     }
+
   };
 
-  // ----------------------------------------------------------
-  // Sarvam request
-  // ----------------------------------------------------------
 
-  const sarvamResponse =
+  // ==========================================================
+  // CALL SARVAM
+  // ==========================================================
+
+  const response =
     await fetchWithTimeout(
       CONFIG.SARVAM_URL,
       {
-        method: "POST",
+
+        method:
+          "POST",
 
         headers: {
+
           "Content-Type":
             "application/json",
 
           "api-subscription-key":
             env.SARVAM_API_KEY
+
         },
 
-        body: JSON.stringify({
-          model: CONFIG.SARVAM_MODEL,
+        body:
+          JSON.stringify({
 
-          messages: [
-            {
-              role: "system",
-              content: systemPrompt
-            },
-            {
-              role: "user",
-              content: userPrompt
-            }
-          ],
+            model:
+              CONFIG.SARVAM_MODEL,
 
-          response_format:
-            responseFormat,
+            messages: [
 
-          temperature: 0.1,
+              {
+                role:
+                  "system",
 
-          max_tokens: 4096,
+                content:
+                  systemPrompt
+              },
 
-          reasoning_effort: "low"
-        })
+              {
+                role:
+                  "user",
+
+                content:
+                  userPrompt
+              }
+
+            ],
+
+            // ------------------------------------------------
+            // Structured JSON
+            // ------------------------------------------------
+
+            response_format:
+              responseFormat,
+
+            // ------------------------------------------------
+            // Very low randomness
+            // ------------------------------------------------
+
+            temperature:
+              0.1,
+
+            // ------------------------------------------------
+            // IMPORTANT:
+            //
+            // Disable reasoning.
+            //
+            // This is an extraction task, not a reasoning task.
+            // ------------------------------------------------
+
+            reasoning_effort:
+              null,
+
+            // ------------------------------------------------
+            // Give enough room for many extracted facts.
+            // ------------------------------------------------
+
+            max_tokens:
+              4096
+
+          })
+
       },
 
-      60_000
+      CONFIG.SARVAM_TIMEOUT
     );
 
-  // ----------------------------------------------------------
-  // Read Sarvam response
-  // ----------------------------------------------------------
 
-  const responseText =
-    await sarvamResponse.text();
+  // ==========================================================
+  // READ RESPONSE
+  // ==========================================================
 
-  if (!sarvamResponse.ok) {
+  const raw =
+    await response.text();
+
+
+  if (!response.ok) {
+
     throw new Error(
-      `Sarvam API error ${sarvamResponse.status}: ${responseText.slice(
+      `Sarvam HTTP ${response.status}: ${raw.slice(
         0,
-        1000
+        1500
       )}`
     );
+
   }
 
-  let responseJson;
+
+  let apiResponse;
 
   try {
-    responseJson =
-      JSON.parse(responseText);
+
+    apiResponse =
+      JSON.parse(raw);
 
   } catch {
+
     throw new Error(
-      "Sarvam returned invalid HTTP JSON."
+      "Sarvam returned invalid JSON."
     );
+
   }
 
+
+  // ==========================================================
+  // GET MODEL CONTENT
+  // ==========================================================
+
   const content =
-    responseJson
+    apiResponse
       ?.choices?.[0]
       ?.message
       ?.content;
 
+
   if (!content) {
+
     throw new Error(
-      "Sarvam returned no message content."
+      "Sarvam returned empty content."
     );
+
   }
 
-  // ----------------------------------------------------------
-  // Parse structured model JSON
-  // ----------------------------------------------------------
 
-  let extracted;
+  // ==========================================================
+  // PARSE MODEL JSON
+  // ==========================================================
+
+  let result;
 
   try {
-    extracted =
+
+    result =
       typeof content === "string"
         ? JSON.parse(content)
         : content;
 
   } catch {
+
     throw new Error(
-      "Sarvam returned invalid structured content."
+      "Sarvam output could not be parsed as JSON."
     );
+
   }
 
-  return extracted;
+
+  return result;
+
 }
 
 
 // ============================================================
-// NORMALIZE AI FIELDS
+// NORMALIZE FIELDS
 // ============================================================
 
-function normalizeExtractedFields(
+function normalizeFields(
   fields
 ) {
-  const output = [];
-  const used = new Set();
 
-  for (const item of fields) {
-    if (!item) continue;
+  if (
+    !Array.isArray(fields)
+  ) {
+
+    return [];
+
+  }
+
+
+  const results = [];
+
+
+  for (
+    const item of fields
+  ) {
+
+    if (!item) {
+      continue;
+    }
+
+
+    // --------------------------------------------------------
+    // FIELD NAME
+    // --------------------------------------------------------
 
     let field =
-      String(item.field || "")
+      String(
+        item.field || ""
+      )
         .trim()
         .toLowerCase();
 
-    if (!field) continue;
 
-    // --------------------------------------------------------
-    // Convert spaces/hyphens to underscores
-    // --------------------------------------------------------
-
-    field = field
-      .replace(/[\s-]+/g, "_")
-      .replace(/[^a-z0-9_]/g, "")
-      .replace(/_+/g, "_")
-      .replace(/^_+|_+$/g, "");
-
-    if (!field) continue;
-
-    // --------------------------------------------------------
-    // Prevent useless field names
-    // --------------------------------------------------------
-
-    const badNames = new Set([
-      "section",
-      "section_1",
-      "section_2",
-      "text",
-      "text_1",
-      "text_2",
-      "data",
-      "data_1",
-      "data_2",
-      "unknown",
-      "information",
-      "content",
-      "page_content"
-    ]);
-
-    if (badNames.has(field)) {
+    if (!field) {
       continue;
     }
 
-    // --------------------------------------------------------
-    // Prevent duplicate fields from the same chunk
-    // --------------------------------------------------------
 
-    let finalField = field;
+    field =
+      field
+        .replace(
+          /[\s-]+/g,
+          "_"
+        )
+        .replace(
+          /[^a-z0-9_]/g,
+          ""
+        )
+        .replace(
+          /_+/g,
+          "_"
+        )
+        .replace(
+          /^_+|_+$/g,
+          ""
+        );
 
-    let counter = 2;
 
-    while (used.has(finalField)) {
-      finalField =
-        `${field}_${counter}`;
-
-      counter++;
-    }
-
-    used.add(finalField);
-
-    // --------------------------------------------------------
-    // Make sure data exists
-    // --------------------------------------------------------
-
-    if (
-      item.data === undefined
-    ) {
+    if (!field) {
       continue;
     }
 
+
     // --------------------------------------------------------
-    // Remove empty strings
+    // Reject useless names
     // --------------------------------------------------------
 
+    const forbidden =
+      new Set([
+
+        "section",
+        "section_1",
+        "section_2",
+
+        "text",
+        "text_1",
+        "text_2",
+
+        "data",
+        "data_1",
+        "data_2",
+
+        "unknown",
+        "information",
+
+        "content"
+
+      ]);
+
+
     if (
-      typeof item.data === "string" &&
-      !item.data.trim()
+      forbidden.has(field)
     ) {
+
       continue;
+
     }
 
+
     // --------------------------------------------------------
-    // Avoid absurdly large field values
+    // DATA
     // --------------------------------------------------------
 
-    let data = item.data;
+    let data =
+      item.data;
+
 
     if (
-      typeof data === "string" &&
-      data.length > 50_000
+      typeof data !==
+      "string"
     ) {
+
       data =
-        data.slice(0, 50_000);
+        JSON.stringify(
+          data
+        );
+
     }
 
-    output.push({
-      field: finalField,
-      data
+
+    data =
+      data.trim();
+
+
+    if (!data) {
+      continue;
+    }
+
+
+    // --------------------------------------------------------
+    // Convert AI's JSON string back into JSONB
+    //
+    // Example:
+    //
+    // "[\"Dental implants\",\"Root canal\"]"
+    //
+    // becomes a real JSON array.
+    // --------------------------------------------------------
+
+    let parsedData;
+
+
+    try {
+
+      parsedData =
+        JSON.parse(
+          data
+        );
+
+    } catch {
+
+      // Normal text
+      parsedData =
+        data;
+
+    }
+
+
+    results.push({
+
+      field,
+
+      data:
+        parsedData
+
     });
+
   }
 
-  return output;
+
+  return results;
+
 }
 
 
 // ============================================================
-// SAVE BUSINESS DATA TO SUPABASE
+// SAVE TO SUPABASE
 // ============================================================
 
 async function saveBusinessData(
@@ -938,158 +1286,217 @@ async function saveBusinessData(
   data,
   sourceUrl
 ) {
-  const url =
+
+
+  const endpoint =
     `${env.SUPABASE_URL}/rest/v1/business_data` +
     `?on_conflict=application_id,source_url,field`;
 
+
   const response =
-    await fetch(url, {
-      method: "POST",
+    await fetch(
+      endpoint,
+      {
 
-      headers: {
-        "Content-Type":
-          "application/json",
+        method:
+          "POST",
 
-        "apikey":
-          env.SUPABASE_SECRET_KEY,
+        headers: {
 
-        "Authorization":
-          `Bearer ${env.SUPABASE_SECRET_KEY}`,
+          "Content-Type":
+            "application/json",
 
-        "Prefer":
-          "resolution=merge-duplicates,return=minimal"
-      },
+          "apikey":
+            env.SUPABASE_SECRET_KEY,
 
-      body: JSON.stringify({
-        application_id:
-          applicationId,
+          "Authorization":
+            `Bearer ${env.SUPABASE_SECRET_KEY}`,
 
-        field,
+          "Prefer":
+            "resolution=merge-duplicates,return=minimal"
 
-        data,
+        },
 
-        source_url:
-          sourceUrl,
+        body:
+          JSON.stringify({
 
-        updated_at:
-          new Date().toISOString()
-      })
-    });
+            application_id:
+              applicationId,
+
+            field,
+
+            data,
+
+            source_url:
+              sourceUrl,
+
+            updated_at:
+              new Date().toISOString()
+
+          })
+
+      }
+    );
+
 
   if (!response.ok) {
-    const errorText =
+
+    const error =
       await response.text();
 
+
     throw new Error(
-      `Supabase save failed ${response.status}: ${errorText}`
+      `Supabase error ${response.status}: ${error}`
     );
+
   }
+
 }
 
 
 // ============================================================
-// GET APPLICATION
+// VERIFY APPLICATION
 // ============================================================
 
 async function getApplication(
   env,
   applicationId
 ) {
-  const url =
+
+
+  const endpoint =
     `${env.SUPABASE_URL}/rest/v1/applications` +
-    `?id=eq.${encodeURIComponent(applicationId)}` +
+    `?id=eq.${encodeURIComponent(
+      applicationId
+    )}` +
     `&select=id,user_id,name` +
     `&limit=1`;
 
+
   const response =
-    await fetch(url, {
-      method: "GET",
+    await fetch(
+      endpoint,
+      {
 
-      headers: {
-        "apikey":
-          env.SUPABASE_SECRET_KEY,
+        headers: {
 
-        "Authorization":
-          `Bearer ${env.SUPABASE_SECRET_KEY}`
+          "apikey":
+            env.SUPABASE_SECRET_KEY,
+
+          "Authorization":
+            `Bearer ${env.SUPABASE_SECRET_KEY}`
+
+        }
+
       }
-    });
+    );
+
 
   if (!response.ok) {
+
     throw new Error(
-      `Could not verify application. HTTP ${response.status}`
+      `Application lookup failed: ${response.status}`
     );
+
   }
+
 
   const rows =
     await response.json();
 
+
   return rows?.[0] || null;
+
 }
 
 
 // ============================================================
-// WEBSITE PAGE DISCOVERY
+// PAGE DISCOVERY
 // ============================================================
 
-async function discoverWebsitePages(
-  baseUrl
+async function discoverPages(
+  websiteUrl
 ) {
+
+
   const origin =
-    new URL(baseUrl).origin;
+    new URL(
+      websiteUrl
+    ).origin;
 
-  const allowedHost =
-    new URL(baseUrl).hostname;
 
-  const urls = new Set();
+  const hostname =
+    new URL(
+      websiteUrl
+    ).hostname;
+
+
+  const urls =
+    new Set();
+
 
   // ----------------------------------------------------------
-  // Always include homepage
+  // Homepage
   // ----------------------------------------------------------
 
   urls.add(
-    normalizeUrl(baseUrl)
+    normalizeUrl(
+      websiteUrl
+    )
   );
 
+
   // ----------------------------------------------------------
-  // Find sitemap locations
+  // Sitemap candidates
   // ----------------------------------------------------------
 
-  const sitemapCandidates =
+  const sitemapQueue =
     new Set([
-      `${origin}/sitemap.xml`
+
+      `${origin}/sitemap.xml`,
+
+      `${origin}/sitemap_index.xml`
+
     ]);
+
 
   // ----------------------------------------------------------
   // robots.txt
   // ----------------------------------------------------------
 
   try {
-    const robotsUrl =
-      `${origin}/robots.txt`;
 
-    const robotsResponse =
+    const robots =
       await fetchWithTimeout(
-        robotsUrl,
+        `${origin}/robots.txt`,
         {
           headers: {
             "User-Agent":
-              "ReportliAI-WebsiteKnowledgeBot/1.0"
+              "ReportliAI-KnowledgeBot/1.0"
           }
         },
-        CONFIG.FETCH_TIMEOUT_MS
+        CONFIG.WEBSITE_TIMEOUT
       );
 
-    if (robotsResponse.ok) {
-      const robots =
-        await robotsResponse.text();
+
+    if (robots.ok) {
+
+      const text =
+        await robots.text();
+
 
       const matches =
-        robots.match(
+        text.match(
           /Sitemap:\s*(.+)/gi
         );
 
+
       if (matches) {
-        for (const line of matches) {
+
+        for (
+          const line of matches
+        ) {
+
           const sitemap =
             line
               .replace(
@@ -1098,218 +1505,324 @@ async function discoverWebsitePages(
               )
               .trim();
 
-          if (isSafeUrl(sitemap)) {
-            sitemapCandidates.add(
+
+          if (
+            isSafeUrl(
+              sitemap
+            )
+          ) {
+
+            sitemapQueue.add(
               sitemap
             );
+
           }
+
         }
+
       }
+
     }
+
   } catch {
-    // robots.txt is optional
+
+    // robots is optional
+
   }
+
 
   // ----------------------------------------------------------
   // Process sitemaps
   // ----------------------------------------------------------
 
-  const processedSitemaps =
+  const processed =
     new Set();
 
-  const sitemapQueue =
-    [...sitemapCandidates];
 
   while (
-    sitemapQueue.length > 0 &&
-    processedSitemaps.size <
+
+    sitemapQueue.size > 0 &&
+
+    processed.size <
       CONFIG.MAX_SITEMAPS
+
   ) {
+
+
     const sitemapUrl =
-      sitemapQueue.shift();
+      sitemapQueue.values()
+        .next()
+        .value;
 
-    if (
-      processedSitemaps.has(
-        sitemapUrl
-      )
-    ) {
-      continue;
-    }
 
-    processedSitemaps.add(
+    sitemapQueue.delete(
       sitemapUrl
     );
 
+
+    if (
+      processed.has(
+        sitemapUrl
+      )
+    ) {
+
+      continue;
+
+    }
+
+
+    processed.add(
+      sitemapUrl
+    );
+
+
     try {
-      const sitemapResponse =
+
+      const response =
         await fetchWithTimeout(
           sitemapUrl,
           {
             headers: {
               "User-Agent":
-                "ReportliAI-WebsiteKnowledgeBot/1.0"
+                "ReportliAI-KnowledgeBot/1.0"
             }
           },
-          CONFIG.FETCH_TIMEOUT_MS
+          CONFIG.WEBSITE_TIMEOUT
         );
 
-      if (!sitemapResponse.ok) {
+
+      if (!response.ok) {
         continue;
       }
 
+
       const xml =
         await readLimitedText(
-          sitemapResponse,
+          response,
           2_000_000
         );
 
+
       // ------------------------------------------------------
-      // Sitemap index
+      // Sitemap indexes
       // ------------------------------------------------------
 
-      const sitemapLocations =
-        extractXmlValues(
+      const childSitemaps =
+        extractXmlLocs(
           xml,
           "sitemap"
         );
 
-      for (const childSitemap of sitemapLocations) {
+
+      for (
+        const child of childSitemaps
+      ) {
+
         if (
-          sitemapQueue.length <
+          processed.size +
+            sitemapQueue.size <
           CONFIG.MAX_SITEMAPS
         ) {
-          sitemapQueue.push(
-            childSitemap
+
+          sitemapQueue.add(
+            child
           );
+
         }
+
       }
 
+
       // ------------------------------------------------------
-      // URL entries
+      // Page URLs
       // ------------------------------------------------------
 
-      const pageLocations =
-        extractXmlValues(
+      const pageUrls =
+        extractXmlLocs(
           xml,
           "url"
         );
 
-      for (const pageUrl of pageLocations) {
+
+      for (
+        const pageUrl of pageUrls
+      ) {
+
         if (
           urls.size >=
           CONFIG.MAX_DISCOVERED_URLS
         ) {
+
           break;
+
         }
 
+
         try {
+
           const parsed =
-            new URL(pageUrl);
+            new URL(
+              pageUrl
+            );
+
 
           if (
             parsed.hostname ===
-            allowedHost
+            hostname
           ) {
+
             urls.add(
-              normalizeUrl(pageUrl)
+              normalizeUrl(
+                pageUrl
+              )
             );
+
           }
+
         } catch {
-          // ignore invalid URL
+
+          // ignore
+
         }
+
       }
 
     } catch {
-      // Ignore bad sitemap
+
+      // ignore broken sitemap
+
     }
+
   }
 
+
   // ----------------------------------------------------------
-  // Also crawl internal links from homepage
+  // Also crawl homepage links
   // ----------------------------------------------------------
 
   try {
-    const homepageResponse =
+
+    const response =
       await fetchWithTimeout(
-        baseUrl,
+        websiteUrl,
         {
           headers: {
             "User-Agent":
-              "ReportliAI-WebsiteKnowledgeBot/1.0"
+              "ReportliAI-KnowledgeBot/1.0"
           }
         },
-        CONFIG.FETCH_TIMEOUT_MS
+        CONFIG.WEBSITE_TIMEOUT
       );
 
-    if (homepageResponse.ok) {
+
+    if (response.ok) {
+
       const html =
         await readLimitedText(
-          homepageResponse,
+          response,
           CONFIG.MAX_HTML_BYTES
         );
+
 
       const links =
         extractInternalLinks(
           html,
           origin,
-          allowedHost
+          hostname
         );
 
-      for (const link of links) {
+
+      for (
+        const link of links
+      ) {
+
         if (
           urls.size >=
           CONFIG.MAX_DISCOVERED_URLS
         ) {
+
           break;
+
         }
 
-        urls.add(link);
+
+        urls.add(
+          link
+        );
+
       }
+
     }
+
   } catch {
-    // Homepage link discovery is optional
+
+    // ignore
+
   }
 
+
   return {
-    urls: [...urls],
-    sitemaps_found:
-      processedSitemaps.size
+
+    urls:
+      [...urls]
+
   };
+
 }
 
 
 // ============================================================
-// EXTRACT XML VALUES
+// EXTRACT XML LOCATIONS
 // ============================================================
 
-function extractXmlValues(
+function extractXmlLocs(
   xml,
-  tag
+  type
 ) {
-  const values = [];
+
+
+  const results = [];
+
 
   const regex =
     new RegExp(
-      `<${tag}[^>]*>\\s*<loc[^>]*>([\\s\\S]*?)<\\/loc>\\s*<\\/${tag}>`,
+      `<${type}[^>]*>[\\s\\S]*?<loc[^>]*>([\\s\\S]*?)<\\/loc>[\\s\\S]*?<\\/${type}>`,
       "gi"
     );
 
+
   let match;
 
+
   while (
-    (match = regex.exec(xml))
+    (match =
+      regex.exec(xml))
   ) {
+
     const value =
       decodeHtmlEntities(
-        match[1].trim()
+        match[1]
+          .trim()
       );
 
-    if (value) {
-      values.push(value);
+
+    if (
+      isSafeUrl(
+        value
+      )
+    ) {
+
+      results.push(
+        value
+      );
+
     }
+
   }
 
-  return values;
+
+  return results;
+
 }
 
 
@@ -1320,59 +1833,95 @@ function extractXmlValues(
 function extractInternalLinks(
   html,
   origin,
-  allowedHost
+  hostname
 ) {
-  const links = new Set();
+
+
+  const links =
+    new Set();
+
 
   const regex =
     /<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>/gi;
 
+
   let match;
 
+
   while (
-    (match = regex.exec(html))
+    (match =
+      regex.exec(html))
   ) {
-    const raw =
+
+
+    let raw =
       decodeHtmlEntities(
         match[1]
-      ).trim();
+      )
+        .trim();
+
 
     if (
       !raw ||
       raw.startsWith("#") ||
-      raw.startsWith("mailto:") ||
-      raw.startsWith("tel:") ||
-      raw.startsWith("javascript:")
+      raw.startsWith(
+        "mailto:"
+      ) ||
+      raw.startsWith(
+        "tel:"
+      ) ||
+      raw.startsWith(
+        "javascript:"
+      )
     ) {
+
       continue;
+
     }
 
+
     try {
+
       const url =
-        new URL(raw, origin);
+        new URL(
+          raw,
+          origin
+        );
+
 
       if (
         url.hostname !==
-        allowedHost
+        hostname
       ) {
+
         continue;
+
       }
+
 
       url.hash = "";
 
-      const normalized =
+
+      links.add(
         normalizeUrl(
           url.toString()
-        );
+        )
+      );
 
-      links.add(normalized);
 
     } catch {
-      // Ignore invalid links
+
+      // ignore
+
     }
+
   }
 
-  return [...links];
+
+  return [
+    ...links
+  ];
+
 }
 
 
@@ -1380,48 +1929,20 @@ function extractInternalLinks(
 // CLEAN HTML
 // ============================================================
 
-function extractReadablePage(
+function extractReadableContent(
   html
 ) {
-  // ----------------------------------------------------------
-  // Remove scripts/styles/etc.
-  // ----------------------------------------------------------
 
-  let cleaned =
-    html
-      .replace(
-        /<script\b[^>]*>[\s\S]*?<\/script>/gi,
-        " "
-      )
-      .replace(
-        /<style\b[^>]*>[\s\S]*?<\/style>/gi,
-        " "
-      )
-      .replace(
-        /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
-        " "
-      )
-      .replace(
-        /<svg\b[^>]*>[\s\S]*?<\/svg>/gi,
-        " "
-      )
-      .replace(
-        /<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi,
-        " "
-      )
-      .replace(
-        /<canvas\b[^>]*>[\s\S]*?<\/canvas>/gi,
-        " "
-      );
 
   // ----------------------------------------------------------
-  // Extract title
+  // Title
   // ----------------------------------------------------------
 
   const titleMatch =
-    cleaned.match(
+    html.match(
       /<title\b[^>]*>([\s\S]*?)<\/title>/i
     );
+
 
   const title =
     titleMatch
@@ -1430,65 +1951,98 @@ function extractReadablePage(
         )
       : "";
 
+
   // ----------------------------------------------------------
-  // Remove common navigation/boilerplate areas
+  // Remove things AI doesn't need
   // ----------------------------------------------------------
 
-  cleaned =
-    cleaned
+  let content =
+    html
+
+      .replace(
+        /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+        " "
+      )
+
+      .replace(
+        /<style\b[^>]*>[\s\S]*?<\/style>/gi,
+        " "
+      )
+
+      .replace(
+        /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
+        " "
+      )
+
+      .replace(
+        /<svg\b[^>]*>[\s\S]*?<\/svg>/gi,
+        " "
+      )
+
+      .replace(
+        /<canvas\b[^>]*>[\s\S]*?<\/canvas>/gi,
+        " "
+      )
+
+      .replace(
+        /<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi,
+        " "
+      )
+
       .replace(
         /<nav\b[^>]*>[\s\S]*?<\/nav>/gi,
         " "
       )
+
       .replace(
         /<footer\b[^>]*>[\s\S]*?<\/footer>/gi,
         " "
       )
-      .replace(
-        /<header\b[^>]*>[\s\S]*?<\/header>/gi,
-        " "
-      )
+
       .replace(
         /<aside\b[^>]*>[\s\S]*?<\/aside>/gi,
         " "
       );
 
-  // ----------------------------------------------------------
-  // Preserve useful block boundaries
-  // ----------------------------------------------------------
-
-  cleaned =
-    cleaned
-      .replace(
-        /<\/(p|div|section|article|main|h1|h2|h3|h4|h5|h6|li|br|tr)>/gi,
-        "\n"
-      );
 
   // ----------------------------------------------------------
-  // Remove HTML tags
+  // Preserve block boundaries
   // ----------------------------------------------------------
 
-  cleaned =
-    cleaned.replace(
+  content =
+    content.replace(
+      /<\/(p|div|section|article|main|li|h1|h2|h3|h4|h5|h6|tr|br)>/gi,
+      "\n"
+    );
+
+
+  // ----------------------------------------------------------
+  // Remove tags
+  // ----------------------------------------------------------
+
+  content =
+    content.replace(
       /<[^>]+>/g,
       " "
     );
+
 
   // ----------------------------------------------------------
   // Decode entities
   // ----------------------------------------------------------
 
-  cleaned =
+  content =
     decodeHtmlEntities(
-      cleaned
+      content
     );
 
+
   // ----------------------------------------------------------
-  // Normalize whitespace
+  // Normalize
   // ----------------------------------------------------------
 
-  cleaned =
-    cleaned
+  content =
+    content
       .replace(
         /\u00a0/g,
         " "
@@ -1503,128 +2057,163 @@ function extractReadablePage(
       )
       .trim();
 
+
   // ----------------------------------------------------------
-  // Remove extremely repetitive blank lines
+  // Remove blank lines
   // ----------------------------------------------------------
 
-  cleaned =
-    cleaned
+  content =
+    content
       .split("\n")
       .map(
-        line => line.trim()
+        line =>
+          line.trim()
       )
-      .filter(Boolean)
+      .filter(
+        Boolean
+      )
       .join("\n");
 
+
   return {
+
     title,
-    text: cleaned
+
+    text:
+      content
+
   };
+
 }
 
 
 // ============================================================
-// CHUNK TEXT
+// SMART CHUNKING
+//
+// This is one of the biggest changes.
+//
+// Instead of 30,000 characters,
+// use ~6,000-character chunks.
+//
+// We also overlap 500 characters so a fact that
+// crosses a boundary is less likely to be lost.
 // ============================================================
 
-function chunkText(
+function createChunks(
   text,
-  maxChars,
-  maxChunks
+  chunkSize,
+  overlap
 ) {
-  if (
-    text.length <= maxChars
-  ) {
-    return [text];
-  }
+
 
   const chunks = [];
 
-  // ----------------------------------------------------------
-  // Prefer paragraph boundaries
-  // ----------------------------------------------------------
-
-  const paragraphs =
-    text
-      .split(/\n{2,}/)
-      .map(
-        p => p.trim()
-      )
-      .filter(Boolean);
-
-  let current = "";
-
-  for (const paragraph of paragraphs) {
-    if (
-      current.length +
-        paragraph.length +
-        2 <=
-      maxChars
-    ) {
-      current +=
-        (current ? "\n\n" : "") +
-        paragraph;
-
-    } else {
-      if (current) {
-        chunks.push(current);
-      }
-
-      // ------------------------------------------------------
-      // Paragraph itself is too large
-      // ------------------------------------------------------
-
-      if (
-        paragraph.length >
-        maxChars
-      ) {
-        for (
-          let i = 0;
-          i < paragraph.length;
-          i += maxChars
-        ) {
-          chunks.push(
-            paragraph.slice(
-              i,
-              i + maxChars
-            )
-          );
-
-          if (
-            chunks.length >=
-            maxChunks
-          ) {
-            return chunks;
-          }
-        }
-
-        current = "";
-
-      } else {
-        current = paragraph;
-      }
-    }
-
-    if (
-      chunks.length >=
-      maxChunks
-    ) {
-      break;
-    }
-  }
 
   if (
-    current &&
-    chunks.length <
-      maxChunks
+    text.length <=
+    chunkSize
   ) {
-    chunks.push(current);
+
+    return [
+      text
+    ];
+
   }
 
-  return chunks.slice(
-    0,
-    maxChunks
-  );
+
+  let start = 0;
+
+
+  while (
+    start < text.length
+  ) {
+
+
+    let end =
+      Math.min(
+        start +
+          chunkSize,
+        text.length
+      );
+
+
+    // --------------------------------------------------------
+    // Prefer ending at paragraph boundary
+    // --------------------------------------------------------
+
+    if (
+      end <
+      text.length
+    ) {
+
+      const paragraphBreak =
+        text.lastIndexOf(
+          "\n\n",
+          end
+        );
+
+
+      if (
+        paragraphBreak >
+        start +
+          Math.floor(
+            chunkSize *
+              0.6
+          )
+      ) {
+
+        end =
+          paragraphBreak;
+
+      }
+
+    }
+
+
+    const chunk =
+      text
+        .slice(
+          start,
+          end
+        )
+        .trim();
+
+
+    if (chunk) {
+
+      chunks.push(
+        chunk
+      );
+
+    }
+
+
+    if (
+      end >=
+      text.length
+    ) {
+
+      break;
+
+    }
+
+
+    // --------------------------------------------------------
+    // Overlap
+    // --------------------------------------------------------
+
+    start =
+      Math.max(
+        end -
+          overlap,
+        start + 1
+      );
+
+  }
+
+
+  return chunks;
+
 }
 
 
@@ -1636,71 +2225,101 @@ async function readLimitedText(
   response,
   maxBytes
 ) {
-  const reader =
-    response.body?.getReader();
 
-  if (!reader) {
+
+  if (!response.body) {
+
     const text =
       await response.text();
 
+
     if (
       new TextEncoder()
-        .encode(text).length >
+        .encode(text)
+        .length >
       maxBytes
     ) {
+
       throw new Error(
-        "Response is too large."
+        "Response too large."
       );
+
     }
 
+
     return text;
+
   }
+
+
+  const reader =
+    response.body.getReader();
+
 
   const decoder =
     new TextDecoder();
 
-  let result = "";
-  let totalBytes = 0;
+
+  let result =
+    "";
+
+  let total =
+    0;
+
 
   while (true) {
+
     const {
       done,
       value
-    } = await reader.read();
+    } =
+      await reader.read();
+
 
     if (done) {
       break;
     }
 
-    totalBytes +=
+
+    total +=
       value.byteLength;
 
+
     if (
-      totalBytes >
+      total >
       maxBytes
     ) {
+
       try {
         await reader.cancel();
       } catch {}
 
+
       throw new Error(
         "Response exceeded size limit."
       );
+
     }
+
 
     result +=
       decoder.decode(
         value,
         {
-          stream: true
+          stream:
+            true
         }
       );
+
   }
+
 
   result +=
     decoder.decode();
 
+
   return result;
+
 }
 
 
@@ -1711,141 +2330,197 @@ async function readLimitedText(
 async function fetchWithTimeout(
   url,
   options = {},
-  timeoutMs = 15_000
+  timeoutMs
 ) {
+
+
   const controller =
     new AbortController();
 
+
   const timer =
     setTimeout(
-      () => controller.abort(),
+      () =>
+        controller.abort(),
       timeoutMs
     );
 
+
   try {
+
     return await fetch(
       url,
       {
         ...options,
+
         signal:
           controller.signal
       }
     );
 
   } catch (error) {
+
     if (
       error.name ===
       "AbortError"
     ) {
+
       throw new Error(
-        `Request timed out after ${timeoutMs}ms: ${url}`
+        `Request timed out: ${url}`
       );
+
     }
+
 
     throw error;
 
   } finally {
-    clearTimeout(timer);
+
+    clearTimeout(
+      timer
+    );
+
   }
+
 }
 
 
 // ============================================================
-// URL HELPERS
+// URL NORMALIZATION
 // ============================================================
 
 function normalizeWebsiteUrl(
   input
 ) {
+
+
   let value =
-    String(input).trim();
+    String(
+      input
+    ).trim();
+
 
   if (
-    !/^https?:\/\//i.test(value)
+    !/^https?:\/\//i.test(
+      value
+    )
   ) {
+
     value =
-      "https://" + value;
+      "https://" +
+      value;
+
   }
+
 
   const url =
-    new URL(value);
+    new URL(
+      value
+    );
 
-  url.hash = "";
 
-  if (
-    url.pathname !== "/" &&
-    url.pathname.endsWith("/")
-  ) {
-    url.pathname =
-      url.pathname.slice(
-        0,
-        -1
-      );
-  }
+  url.hash =
+    "";
 
-  return url.toString();
+
+  return normalizeUrl(
+    url.toString()
+  );
+
 }
 
+
+// ============================================================
+// NORMALIZE URL
+// ============================================================
 
 function normalizeUrl(
   input
 ) {
+
+
   const url =
-    new URL(input);
+    new URL(
+      input
+    );
 
-  url.hash = "";
 
-  // Remove common tracking parameters.
-  const trackingPrefixes = [
-    "utm_",
+  url.hash =
+    "";
+
+
+  const removeParams = [
+
     "fbclid",
     "gclid",
     "mc_cid",
     "mc_eid"
+
   ];
+
 
   for (
     const key of [
       ...url.searchParams.keys()
     ]
   ) {
+
     if (
-      trackingPrefixes.some(
-        prefix =>
-          key === prefix ||
-          key.startsWith(prefix)
+      key.startsWith(
+        "utm_"
+      ) ||
+      removeParams.includes(
+        key
       )
     ) {
+
       url.searchParams.delete(
         key
       );
+
     }
+
   }
+
 
   let result =
     url.toString();
+
 
   if (
     url.pathname !== "/" &&
     result.endsWith("/")
   ) {
+
     result =
       result.slice(
         0,
         -1
       );
+
   }
 
+
   return result;
+
 }
 
+
+// ============================================================
+// SAFE URL
+// ============================================================
 
 function isSafeUrl(
   input
 ) {
+
   try {
+
     const url =
-      new URL(input);
+      new URL(
+        input
+      );
+
 
     return (
       url.protocol ===
@@ -1855,20 +2530,26 @@ function isSafeUrl(
     );
 
   } catch {
+
     return false;
+
   }
+
 }
 
 
 // ============================================================
-// HTML TEXT HELPERS
+// CLEAN TEXT
 // ============================================================
 
 function cleanText(
   value
 ) {
+
   return decodeHtmlEntities(
-    String(value)
+    String(
+      value
+    )
       .replace(
         /<[^>]+>/g,
         " "
@@ -1879,44 +2560,62 @@ function cleanText(
       )
       .trim()
   );
+
 }
 
+
+// ============================================================
+// HTML ENTITY DECODER
+// ============================================================
 
 function decodeHtmlEntities(
   value
 ) {
-  return String(value)
+
+  return String(
+    value
+  )
+
     .replace(
       /&nbsp;/gi,
       " "
     )
+
     .replace(
       /&amp;/gi,
       "&"
     )
+
     .replace(
       /&quot;/gi,
       '"'
     )
+
     .replace(
       /&#39;/gi,
       "'"
     )
+
     .replace(
       /&lt;/gi,
       "<"
     )
+
     .replace(
       /&gt;/gi,
       ">"
     )
+
     .replace(
       /&#(\d+);/g,
       (_, code) =>
         String.fromCharCode(
-          Number(code)
+          Number(
+            code
+          )
         )
     )
+
     .replace(
       /&#x([0-9a-f]+);/gi,
       (_, code) =>
@@ -1927,6 +2626,7 @@ function decodeHtmlEntities(
           )
         )
     );
+
 }
 
 
@@ -1938,32 +2638,43 @@ function jsonResponse(
   data,
   status = 200
 ) {
+
   return new Response(
+
     JSON.stringify(
       data,
       null,
       2
     ),
+
     {
+
       status,
 
       headers: {
+
         "Content-Type":
           "application/json; charset=utf-8",
 
         ...corsHeaders()
+
       }
+
     }
+
   );
+
 }
 
 
 // ============================================================
-// CORS HEADERS
+// CORS
 // ============================================================
 
 function corsHeaders() {
+
   return {
+
     "Access-Control-Allow-Origin":
       "*",
 
@@ -1972,5 +2683,7 @@ function corsHeaders() {
 
     "Access-Control-Allow-Headers":
       "Content-Type, Authorization"
+
   };
+
         }
