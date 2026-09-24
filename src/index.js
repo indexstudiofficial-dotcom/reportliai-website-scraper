@@ -1,370 +1,178 @@
-/**
- * ============================================================
- * REPORTLI AI - WEBSITE SCRAPER WORKER
- * ============================================================
- *
- * INPUT:
- *
- * {
- *   "application_id": "app-1790254969447",
- *   "domain": "https://drjohnysdentalclinicpalakkad.com"
- * }
- *
- * ALSO ACCEPTS:
- *
- * {
- *   "applicationId": "...",
- *   "websiteUrl": "..."
- * }
- *
- * OR:
- *
- * {
- *   "application_id": "...",
- *   "website_url": "..."
- * }
- *
- *
- * FLOW:
- *
- * SaaS
- *   ↓
- * Worker
- *   ↓
- * Validate application
- *   ↓
- * Discover internal pages
- *   ↓
- * Fetch ONE page
- *   ↓
- * Extract readable text
- *   ↓
- * Send ONE page to Sarvam
- *   ↓
- * Receive structured business fields
- *   ↓
- * Save to Supabase business_data
- *   ↓
- * Next page
- *
- * ============================================================
- */
-
-
-/* ============================================================
-   CONFIGURATION
-   ============================================================ */
-
-// Maximum number of HTML pages to crawl per request.
+// ============================================================
+// REPORTLI AI
+// AI-FREE WEBSITE SCRAPER
+// Cloudflare Worker
 //
-// Keep this conservative because every page requires:
-// - Website fetch
-// - Sarvam API call
-// - Supabase save(s)
+// INPUT:
 //
-// For a production queue-based crawler, this can be increased.
-const MAX_PAGES = 20;
+// POST /
+//
+// {
+//   "application_id": "app-123",
+//   "domain": "https://example.com"
+// }
+//
+// OR:
+//
+// {
+//   "application_id": "app-123",
+//   "website_url": "https://example.com"
+// }
+//
+// ============================================================
 
 
-// Maximum HTML size accepted for a page.
-const MAX_HTML_BYTES = 2 * 1024 * 1024;
+// ============================================================
+// CONFIGURATION
+// ============================================================
 
+// Maximum pages processed in one Worker invocation.
+//
+// Increase this carefully because each page requires
+// network requests to the website + Supabase.
+const MAX_PAGES = 40;
 
-// Maximum readable text sent to Sarvam for ONE page.
-const MAX_TEXT_CHARS = 30000;
+// Maximum sitemap files we will inspect.
+const MAX_SITEMAPS = 10;
 
+// Maximum size of one downloaded HTML document.
+const MAX_HTML_SIZE = 2_000_000;
+
+// Maximum text stored for one page.
+const MAX_TEXT_LENGTH = 30_000;
 
 // Website request timeout.
-const FETCH_TIMEOUT_MS = 15000;
+const FETCH_TIMEOUT_MS = 12_000;
 
 
-// Sarvam API.
-const SARVAM_API_URL =
-  "https://api.sarvam.ai/v1/chat/completions";
+// ============================================================
+// CORS
+// ============================================================
 
-const SARVAM_MODEL =
-  "sarvam-105b";
-
-
-// Cloudflare subrequest safety.
-//
-// This is our own approximate counter.
-// We stop before getting too close to the limit.
-const SUBREQUEST_SAFETY_LIMIT = 45;
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods":
+    "POST, OPTIONS"
+};
 
 
-// Runtime counter.
-let subrequestCount = 0;
-
-
-/* ============================================================
-   MAIN WORKER
-   ============================================================ */
+// ============================================================
+// MAIN WORKER
+// ============================================================
 
 export default {
 
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
 
-    // Reset counter for every request.
-    subrequestCount = 0;
+    // --------------------------------------------------------
+    // CORS preflight
+    // --------------------------------------------------------
 
-    console.log("==========================================");
-    console.log("REPORTLI AI WEBSITE SCRAPER");
-    console.log("==========================================");
+    if (request.method === "OPTIONS") {
+
+      return new Response("ok", {
+        headers: CORS_HEADERS
+      });
+
+    }
+
+
+    // --------------------------------------------------------
+    // Only POST
+    // --------------------------------------------------------
+
+    if (request.method !== "POST") {
+
+      return jsonResponse(
+        {
+          error: "Only POST requests are allowed."
+        },
+        405
+      );
+
+    }
+
 
     try {
 
-      /* ======================================================
-         CORS
-         ====================================================== */
+      // ------------------------------------------------------
+      // Check environment variables
+      // ------------------------------------------------------
 
-      if (request.method === "OPTIONS") {
-
-        return new Response(null, {
-          status: 204,
-          headers: corsHeaders()
-        });
-
-      }
+      validateEnvironment(env);
 
 
-      /* ======================================================
-         ONLY POST
-         ====================================================== */
+      // ------------------------------------------------------
+      // Read request body
+      // ------------------------------------------------------
 
-      if (request.method !== "POST") {
-
-        return jsonResponse(
-          {
-            success: false,
-            step: "method_check",
-            error: "Only POST requests are allowed."
-          },
-          405
-        );
-
-      }
+      const body =
+        await request.json();
 
 
-      console.log("STEP 1: POST request received");
-
-
-      /* ======================================================
-         READ JSON BODY
-         ====================================================== */
-
-      let body;
-
-      try {
-
-        body = await request.json();
-
-      } catch (error) {
-
-        console.error(
-          "Invalid JSON:",
-          error
-        );
-
-        return jsonResponse(
-          {
-            success: false,
-            step: "read_request_body",
-            error: "Request body is not valid JSON."
-          },
-          400
-        );
-
-      }
-
-
-      console.log(
-        "REQUEST BODY:",
-        JSON.stringify(body)
-      );
-
-
-      /* ======================================================
-         GET APPLICATION ID
-         ====================================================== */
+      // ------------------------------------------------------
+      // application_id
+      // ------------------------------------------------------
 
       const applicationId =
         body.application_id ||
         body.applicationId;
 
 
-      /* ======================================================
-         GET WEBSITE URL
-         ======================================================
+      // ------------------------------------------------------
+      // Website URL
+      // ------------------------------------------------------
 
-         IMPORTANT FIX:
+      const websiteInput =
+        body.domain ||
+        body.website_url ||
+        body.websiteUrl;
 
-         Your frontend sends:
 
-         {
-           "domain": "https://example.com"
-         }
+      if (!applicationId) {
 
-         Therefore we now support:
+        return jsonResponse(
+          {
+            error:
+              "application_id is required."
+          },
+          400
+        );
 
-         - website_url
-         - websiteUrl
-         - domain
+      }
 
-         ====================================================== */
+
+      if (!websiteInput) {
+
+        return jsonResponse(
+          {
+            error:
+              "domain is required."
+          },
+          400
+        );
+
+      }
+
+
+      // ------------------------------------------------------
+      // Normalize URL
+      // ------------------------------------------------------
 
       const websiteUrl =
-        body.website_url ||
-        body.websiteUrl ||
-        body.domain;
-
-
-      console.log(
-        "APPLICATION ID:",
-        applicationId
-      );
-
-      console.log(
-        "WEBSITE URL:",
-        websiteUrl
-      );
-
-
-      /* ======================================================
-         VALIDATE APPLICATION ID
-         ====================================================== */
-
-      if (
-        !applicationId ||
-        typeof applicationId !== "string" ||
-        !applicationId.trim()
-      ) {
-
-        return jsonResponse(
-          {
-            success: false,
-            step: "validate_input",
-            error: "application_id is missing.",
-            received_body: body
-          },
-          400
+        normalizeUrl(
+          websiteInput
         );
 
-      }
 
-
-      /* ======================================================
-         VALIDATE WEBSITE URL
-         ====================================================== */
-
-      if (
-        !websiteUrl ||
-        typeof websiteUrl !== "string" ||
-        !websiteUrl.trim()
-      ) {
+      if (!websiteUrl) {
 
         return jsonResponse(
           {
-            success: false,
-            step: "validate_input",
-            error: "Website URL is missing. Send website_url, websiteUrl, or domain.",
-            received_body: body
-          },
-          400
-        );
-
-      }
-
-
-      /* ======================================================
-         CHECK ENVIRONMENT
-         ====================================================== */
-
-      if (!env.SUPABASE_URL) {
-
-        return jsonResponse(
-          {
-            success: false,
-            step: "environment",
-            error: "SUPABASE_URL is missing."
-          },
-          500
-        );
-
-      }
-
-
-      if (!env.SUPABASE_SECRET_KEY) {
-
-        return jsonResponse(
-          {
-            success: false,
-            step: "environment",
-            error: "SUPABASE_SECRET_KEY is missing."
-          },
-          500
-        );
-
-      }
-
-
-      if (!env.SARVAM_API_KEY) {
-
-        return jsonResponse(
-          {
-            success: false,
-            step: "environment",
-            error: "SARVAM_API_KEY is missing."
-          },
-          500
-        );
-
-      }
-
-
-      /* ======================================================
-         PARSE URL
-         ====================================================== */
-
-      let startUrl;
-
-      try {
-
-        startUrl =
-          new URL(
-            websiteUrl.trim()
-          );
-
-      } catch (error) {
-
-        return jsonResponse(
-          {
-            success: false,
-            step: "validate_url",
-            error: "Invalid website URL.",
-            website_url: websiteUrl
-          },
-          400
-        );
-
-      }
-
-
-      /* ======================================================
-         HTTP / HTTPS ONLY
-         ====================================================== */
-
-      if (
-        startUrl.protocol !== "http:" &&
-        startUrl.protocol !== "https:"
-      ) {
-
-        return jsonResponse(
-          {
-            success: false,
-            step: "validate_url",
             error:
-              "Only HTTP and HTTPS websites are supported."
+              "Invalid website URL."
           },
           400
         );
@@ -372,22 +180,20 @@ export default {
       }
 
 
-      /* ======================================================
-         SSRF PROTECTION
-         ====================================================== */
+      // ------------------------------------------------------
+      // SSRF protection
+      // ------------------------------------------------------
 
       if (
-        isBlockedHostname(
-          startUrl.hostname
+        !isSafePublicUrl(
+          websiteUrl
         )
       ) {
 
         return jsonResponse(
           {
-            success: false,
-            step: "validate_url",
             error:
-              "This hostname is not allowed."
+              "This website URL is not allowed."
           },
           400
         );
@@ -395,306 +201,254 @@ export default {
       }
 
 
-      console.log(
-        "VALIDATED WEBSITE:",
-        startUrl.href
-      );
+      // ------------------------------------------------------
+      // Verify application
+      // ------------------------------------------------------
 
-
-      /* ======================================================
-         VERIFY APPLICATION EXISTS
-         ====================================================== */
-
-      console.log(
-        "STEP 2: Checking application..."
-      );
-
-
-      const applicationCheck =
-        await getApplication(
+      const applicationExists =
+        await verifyApplication(
           env,
           applicationId
         );
 
 
-      if (!applicationCheck.success) {
+      if (!applicationExists) {
 
         return jsonResponse(
           {
-            success: false,
-            step: "check_application",
-            ...applicationCheck
-          },
-          applicationCheck.status || 500
-        );
-
-      }
-
-
-      console.log(
-        "Application exists."
-      );
-
-
-      /* ======================================================
-         DISCOVER INTERNAL PAGES
-         ====================================================== */
-
-      console.log(
-        "STEP 3: Discovering website pages..."
-      );
-
-
-      const pageMap =
-        await discoverPages(
-          startUrl
-        );
-
-
-      const pages =
-        Array.from(
-          pageMap.keys()
-        );
-
-
-      console.log(
-        "PAGES DISCOVERED:",
-        pages.length
-      );
-
-
-      if (!pages.length) {
-
-        return jsonResponse(
-          {
-            success: false,
-            step: "discover_pages",
             error:
-              "Could not find any crawlable HTML pages."
+              "Application not found."
           },
-          422
+          404
         );
 
       }
 
 
-      /* ======================================================
-         PROCESS PAGES
-         ====================================================== */
+      // ------------------------------------------------------
+      // Determine hostname
+      // ------------------------------------------------------
 
-      const results = [];
+      const website =
+        new URL(
+          websiteUrl
+        );
 
-      let totalFieldsSaved = 0;
 
-      let successfulPages = 0;
+      const hostname =
+        website.hostname;
 
-      let failedPages = 0;
 
-      let stoppedEarly =
-        false;
+      // ------------------------------------------------------
+      // Find sitemap
+      // ------------------------------------------------------
+
+      const sitemapUrls =
+        await discoverSitemaps(
+          websiteUrl
+        );
+
+
+      // ------------------------------------------------------
+      // Discover URLs from sitemap
+      // ------------------------------------------------------
+
+      const sitemapPages =
+        await crawlSitemaps(
+          sitemapUrls,
+          hostname
+        );
+
+
+      // ------------------------------------------------------
+      // Crawl normal website links too
+      //
+      // Sitemap may not contain everything.
+      // ------------------------------------------------------
+
+      const discoveredPages =
+        new Set();
+
+
+      discoveredPages.add(
+        websiteUrl
+      );
 
 
       for (
-        let index = 0;
-        index < pages.length;
-        index++
+        const page of sitemapPages
       ) {
 
+        discoveredPages.add(
+          page
+        );
 
-        /* ====================================================
-           CHECK SUBREQUEST SAFETY
-           ==================================================== */
+      }
+
+
+      // ------------------------------------------------------
+      // Keep only same-host pages
+      // ------------------------------------------------------
+
+      const initialPages =
+        Array.from(
+          discoveredPages
+        )
+        .filter(
+          url =>
+            isSameHostname(
+              url,
+              hostname
+            )
+        );
+
+
+      // ------------------------------------------------------
+      // Queue
+      // ------------------------------------------------------
+
+      const queue = [
+        ...initialPages
+      ];
+
+
+      const queued =
+        new Set(queue);
+
+
+      const processed =
+        new Set();
+
+
+      let pagesProcessed = 0;
+
+      let pagesFailed = 0;
+
+      let fieldsSaved = 0;
+
+
+      // ------------------------------------------------------
+      // Crawl pages
+      // ------------------------------------------------------
+
+      while (
+        queue.length > 0 &&
+        pagesProcessed < MAX_PAGES
+      ) {
+
+        const pageUrl =
+          queue.shift();
+
+
+        if (!pageUrl) {
+          continue;
+        }
+
 
         if (
-          nearSubrequestLimit()
+          processed.has(
+            pageUrl
+          )
         ) {
 
-          console.log(
-            "Stopping because subrequest safety limit was reached."
-          );
-
-          stoppedEarly =
-            true;
-
-          break;
+          continue;
 
         }
 
 
-        const pageUrl =
-          pages[index];
-
-
-        console.log(
-          "------------------------------------------"
-        );
-
-        console.log(
-          `PROCESSING PAGE ${index + 1}/${pages.length}`
-        );
-
-        console.log(
+        processed.add(
           pageUrl
+        );
+
+
+        console.log(
+          `Processing ${pagesProcessed + 1}/${MAX_PAGES}: ${pageUrl}`
         );
 
 
         try {
 
-
-          /* ==================================================
-             GET CACHED HTML
-             ================================================== */
+          // --------------------------------------------------
+          // Fetch HTML
+          // --------------------------------------------------
 
           const html =
-            pageMap.get(
+            await fetchHtml(
               pageUrl
             );
 
 
           if (!html) {
 
-            failedPages++;
-
-            results.push({
-              url: pageUrl,
-              success: false,
-              step: "fetch_page",
-              error:
-                "HTML was not available."
-            });
+            pagesFailed++;
 
             continue;
 
           }
 
 
-          /* ==================================================
-             EXTRACT TEXT
-             ================================================== */
+          // --------------------------------------------------
+          // Extract everything we can without AI
+          // --------------------------------------------------
 
-          const pageText =
-            extractText(
-              html
+          const extracted =
+            extractWebsiteData(
+              html,
+              pageUrl
             );
 
 
-          console.log(
-            "TEXT LENGTH:",
-            pageText.length
-          );
+          // --------------------------------------------------
+          // Save page information
+          // --------------------------------------------------
 
-
-          if (!pageText) {
-
-            failedPages++;
-
-            results.push({
-              url: pageUrl,
-              success: false,
-              step: "extract_text",
-              error:
-                "No readable text found."
-            });
-
-            continue;
-
-          }
-
-
-          /* ==================================================
-             LIMIT TEXT
-             ================================================== */
-
-          const limitedText =
-            pageText.slice(
-              0,
-              MAX_TEXT_CHARS
-            );
-
-
-          /* ==================================================
-             SEND ONE PAGE TO SARVAM
-             ================================================== */
-
-          console.log(
-            "Sending page to Sarvam..."
-          );
-
-
-          const aiResult =
-            await extractBusinessDataWithSarvam(
+          const saved =
+            await saveExtractedData(
               env,
+              applicationId,
               pageUrl,
-              limitedText
+              extracted
             );
 
 
-          if (!aiResult.success) {
-
-            failedPages++;
-
-            results.push({
-              url: pageUrl,
-              success: false,
-              step: "sarvam",
-              error:
-                aiResult.error
-            });
-
-            continue;
-
-          }
+          fieldsSaved +=
+            saved;
 
 
-          console.log(
-            "SARVAM FIELDS:",
-            aiResult.fields.length
-          );
+          pagesProcessed++;
 
 
-          /* ==================================================
-             SAVE FIELDS
-             ================================================== */
+          // --------------------------------------------------
+          // Discover links from this page
+          // --------------------------------------------------
 
-          let pageFieldsSaved = 0;
-
-          const fieldErrors = [];
+          const links =
+            extractInternalLinks(
+              html,
+              pageUrl,
+              hostname
+            );
 
 
           for (
-            const extractedField
-            of aiResult.fields
+            const link of links
           ) {
 
+            if (
+              queue.length +
+              processed.size >=
+              MAX_PAGES * 2
+            ) {
 
-            /* ==============================================
-               NORMALIZE FIELD NAME
-               ============================================== */
-
-            const fieldName =
-              normalizeFieldName(
-                extractedField.field
-              );
-
-
-            if (!fieldName) {
-
-              continue;
+              break;
 
             }
 
 
-            /* ==============================================
-               GET DATA
-               ============================================== */
-
-            const data =
-              extractedField.data;
-
-
             if (
-              data === undefined ||
-              data === null
+              processed.has(
+                link
+              )
             ) {
 
               continue;
@@ -702,214 +456,80 @@ export default {
             }
 
 
-            /* ==============================================
-               SAVE TO SUPABASE
-               ============================================== */
-
-            const saveResult =
-              await saveBusinessData(
-                env,
-                {
-                  application_id:
-                    applicationId,
-
-                  field:
-                    fieldName,
-
-                  data:
-                    data,
-
-                  source_url:
-                    pageUrl,
-
-                  updated_at:
-                    new Date().toISOString()
-                }
-              );
-
-
             if (
-              !saveResult.success
+              queued.has(
+                link
+              )
             ) {
-
-              console.error(
-                "FIELD SAVE FAILED:",
-                fieldName,
-                saveResult.error
-              );
-
-              fieldErrors.push({
-                field:
-                  fieldName,
-
-                error:
-                  saveResult.error
-              });
 
               continue;
 
             }
 
 
-            pageFieldsSaved++;
+            queued.add(
+              link
+            );
 
-            totalFieldsSaved++;
 
-
-            console.log(
-              "SAVED FIELD:",
-              fieldName
+            queue.push(
+              link
             );
 
           }
 
-
-          /* ==================================================
-             PAGE RESULT
-             ================================================== */
-
-          const pageSuccess =
-            fieldErrors.length === 0;
-
-
-          if (pageSuccess) {
-
-            successfulPages++;
-
-          } else {
-
-            failedPages++;
-
-          }
-
-
-          results.push({
-            url:
-              pageUrl,
-
-            success:
-              pageSuccess,
-
-            fields_found:
-              aiResult.fields.length,
-
-            fields_saved:
-              pageFieldsSaved,
-
-            field_errors:
-              fieldErrors
-          });
-
-
-          console.log(
-            `PAGE ${index + 1} FINISHED`
-          );
-
-
-        } catch (pageError) {
-
-
-          failedPages++;
-
+        } catch (error) {
 
           console.error(
-            "PAGE ERROR:",
-            pageError
+            "Page processing failed:",
+            pageUrl,
+            error
           );
 
-
-          results.push({
-            url:
-              pageUrl,
-
-            success:
-              false,
-
-            step:
-              "page_processing",
-
-            error:
-              pageError?.message ||
-              String(pageError)
-          });
+          pagesFailed++;
 
         }
 
       }
 
 
-      /* ======================================================
-         FINAL RESPONSE
-         ====================================================== */
-
-      console.log(
-        "=========================================="
-      );
-
-      console.log(
-        "SCRAPER FINISHED"
-      );
-
-      console.log(
-        "Pages discovered:",
-        pages.length
-      );
-
-      console.log(
-        "Pages successful:",
-        successfulPages
-      );
-
-      console.log(
-        "Pages failed:",
-        failedPages
-      );
-
-      console.log(
-        "Fields saved:",
-        totalFieldsSaved
-      );
-
-      console.log(
-        "=========================================="
-      );
-
+      // ------------------------------------------------------
+      // Response
+      // ------------------------------------------------------
 
       return jsonResponse(
         {
-          success:
-            true,
-
-          message:
-            "Website scraping completed.",
+          success: true,
 
           application_id:
             applicationId,
 
-          website_url:
-            startUrl.href,
+          website:
+            websiteUrl,
 
-          pages_discovered:
-            pages.length,
+          hostname:
+            hostname,
+
+          sitemaps_found:
+            sitemapUrls.length,
+
+          sitemap_pages_found:
+            sitemapPages.length,
 
           pages_processed:
-            successfulPages +
-            failedPages,
-
-          pages_successful:
-            successfulPages,
+            pagesProcessed,
 
           pages_failed:
-            failedPages,
+            pagesFailed,
 
           fields_saved:
-            totalFieldsSaved,
+            fieldsSaved,
 
-          stopped_early:
-            stoppedEarly,
+          max_pages:
+            MAX_PAGES,
 
-          results:
-            results
+          message:
+            "Website data extraction completed without AI."
         },
         200
       );
@@ -917,32 +537,20 @@ export default {
 
     } catch (error) {
 
-
-      /* ======================================================
-         GLOBAL ERROR
-         ====================================================== */
-
       console.error(
-        "GLOBAL WORKER ERROR:",
+        "Worker error:",
         error
       );
 
 
       return jsonResponse(
         {
-          success:
-            false,
-
-          step:
-            "global_error",
+          success: false,
 
           error:
-            error?.message ||
-            String(error),
-
-          stack:
-            error?.stack ||
-            null
+            error instanceof Error
+              ? error.message
+              : "Unknown error."
         },
         500
       );
@@ -954,389 +562,355 @@ export default {
 };
 
 
-/* ============================================================
-   GET APPLICATION
-   ============================================================ */
+// ============================================================
+// ENVIRONMENT VALIDATION
+// ============================================================
 
-async function getApplication(
+function validateEnvironment(env) {
+
+  if (!env.SUPABASE_URL) {
+
+    throw new Error(
+      "SUPABASE_URL secret is missing."
+    );
+
+  }
+
+
+  if (!env.SUPABASE_SECRET_KEY) {
+
+    throw new Error(
+      "SUPABASE_SECRET_KEY secret is missing."
+    );
+
+  }
+
+}
+
+
+// ============================================================
+// VERIFY APPLICATION
+// ============================================================
+
+async function verifyApplication(
   env,
   applicationId
 ) {
 
-  try {
-
-    const url =
-      new URL(
-        `${env.SUPABASE_URL}/rest/v1/applications`
-      );
-
-
-    url.searchParams.set(
-      "id",
-      `eq.${applicationId}`
-    );
+  const url =
+    `${env.SUPABASE_URL}` +
+    `/rest/v1/applications` +
+    `?id=eq.${encodeURIComponent(applicationId)}` +
+    `&select=id`;
 
 
-    url.searchParams.set(
-      "select",
-      "id"
-    );
+  const response =
+    await fetch(
+      url,
+      {
+        method: "GET",
 
+        headers: {
+          "apikey":
+            env.SUPABASE_SECRET_KEY,
 
-    trackSubrequest();
-
-
-    const response =
-      await fetch(
-        url.toString(),
-        {
-          method:
-            "GET",
-
-          headers: {
-            "apikey":
-              env.SUPABASE_SECRET_KEY,
-
-            "Authorization":
-              `Bearer ${env.SUPABASE_SECRET_KEY}`
-          }
+          "Authorization":
+            `Bearer ${env.SUPABASE_SECRET_KEY}`
         }
-      );
-
-
-    const responseText =
-      await response.text();
-
-
-    console.log(
-      "APPLICATION CHECK STATUS:",
-      response.status
+      }
     );
 
 
-    if (
-      !response.ok
-    ) {
+  if (!response.ok) {
 
-      return {
-        success:
-          false,
+    console.error(
+      "Application verification failed:",
+      await response.text()
+    );
 
-        status:
-          500,
-
-        error:
-          `Supabase application check failed: ${responseText}`
-      };
-
-    }
-
-
-    let data;
-
-
-    try {
-
-      data =
-        JSON.parse(
-          responseText
-        );
-
-    } catch {
-
-      return {
-        success:
-          false,
-
-        status:
-          500,
-
-        error:
-          "Supabase returned invalid JSON."
-      };
-
-    }
-
-
-    if (
-      !Array.isArray(data) ||
-      data.length === 0
-    ) {
-
-      return {
-        success:
-          false,
-
-        status:
-          404,
-
-        error:
-          "The application_id does not exist in the applications table.",
-
-        application_id:
-          applicationId
-      };
-
-    }
-
-
-    return {
-      success:
-        true
-    };
-
-
-  } catch (error) {
-
-    return {
-      success:
-        false,
-
-      status:
-        500,
-
-      error:
-        error?.message ||
-        String(error)
-    };
+    throw new Error(
+      "Could not verify application."
+    );
 
   }
+
+
+  const data =
+    await response.json();
+
+
+  return (
+    Array.isArray(data) &&
+    data.length > 0
+  );
 
 }
 
 
-/* ============================================================
-   DISCOVER INTERNAL PAGES
-   ============================================================ */
+// ============================================================
+// DISCOVER SITEMAPS
+// ============================================================
 
-async function discoverPages(
-  startUrl
+async function discoverSitemaps(
+  websiteUrl
 ) {
 
-  const pageMap =
-    new Map();
-
-
-  const queue =
-    [];
-
-
-  const start =
-    normalizeUrl(
-      startUrl.href
+  const website =
+    new URL(
+      websiteUrl
     );
 
 
-  queue.push(
-    start
+  const candidates = [];
+
+
+  // ----------------------------------------------------------
+  // Standard sitemap location
+  // ----------------------------------------------------------
+
+  candidates.push(
+    new URL(
+      "/sitemap.xml",
+      website.origin
+    ).href
   );
 
 
-  const visited =
+  // ----------------------------------------------------------
+  // robots.txt
+  // ----------------------------------------------------------
+
+  try {
+
+    const robotsUrl =
+      new URL(
+        "/robots.txt",
+        website.origin
+      ).href;
+
+
+    const robots =
+      await fetchText(
+        robotsUrl
+      );
+
+
+    if (robots) {
+
+      const lines =
+        robots.split(/\r?\n/);
+
+
+      for (
+        const line of lines
+      ) {
+
+        const match =
+          line.match(
+            /^\s*sitemap\s*:\s*(.+)\s*$/i
+          );
+
+
+        if (match) {
+
+          const sitemap =
+            normalizeUrl(
+              match[1]
+            );
+
+
+          if (sitemap) {
+
+            candidates.push(
+              sitemap
+            );
+
+          }
+
+        }
+
+      }
+
+    }
+
+  } catch (error) {
+
+    console.error(
+      "robots.txt failed:",
+      error
+    );
+
+  }
+
+
+  // ----------------------------------------------------------
+  // Remove duplicates
+  // ----------------------------------------------------------
+
+  return [
+    ...new Set(
+      candidates
+    )
+  ]
+  .slice(
+    0,
+    MAX_SITEMAPS
+  );
+
+}
+
+
+// ============================================================
+// CRAWL SITEMAPS
+// ============================================================
+
+async function crawlSitemaps(
+  sitemapUrls,
+  hostname
+) {
+
+  const pages =
     new Set();
 
 
-  visited.add(
-    start
-  );
+  const sitemapQueue =
+    [...sitemapUrls];
+
+
+  const processedSitemaps =
+    new Set();
 
 
   while (
-    queue.length > 0 &&
-    pageMap.size < MAX_PAGES
+    sitemapQueue.length > 0 &&
+    processedSitemaps.size < MAX_SITEMAPS
   ) {
 
+    const sitemapUrl =
+      sitemapQueue.shift();
 
-    /* ========================================================
-       SUBREQUEST SAFETY
-       ======================================================== */
+
+    if (!sitemapUrl) {
+      continue;
+    }
+
 
     if (
-      nearSubrequestLimit()
+      processedSitemaps.has(
+        sitemapUrl
+      )
     ) {
 
-      console.log(
-        "Discovery stopped because of subrequest safety limit."
-      );
-
-      break;
+      continue;
 
     }
 
 
-    const currentUrl =
-      queue.shift();
+    processedSitemaps.add(
+      sitemapUrl
+    );
 
 
     try {
 
-
-      console.log(
-        "DISCOVERING:",
-        currentUrl
-      );
-
-
-      /* ======================================================
-         FETCH PAGE
-         ====================================================== */
-
-      trackSubrequest();
-
-
-      const response =
-        await fetchWithTimeout(
-          currentUrl,
-          {
-            method:
-              "GET",
-
-            headers: {
-              "User-Agent":
-                "ReportliAI-WebsiteCrawler/1.0",
-
-              "Accept":
-                "text/html,application/xhtml+xml"
-            }
-          },
-          FETCH_TIMEOUT_MS
+      const xml =
+        await fetchText(
+          sitemapUrl
         );
 
 
-      if (
-        !response.ok
-      ) {
-
-        console.log(
-          "HTTP ERROR:",
-          response.status,
-          currentUrl
-        );
-
+      if (!xml) {
         continue;
-
       }
 
 
-      /* ======================================================
-         CONTENT TYPE
-         ====================================================== */
+      // ------------------------------------------------------
+      // Sitemap index
+      // ------------------------------------------------------
 
-      const contentType =
-        response.headers.get(
-          "content-type"
-        ) || "";
-
-
-      if (
-        !contentType.includes(
-          "text/html"
-        ) &&
-        !contentType.includes(
-          "application/xhtml+xml"
-        )
-      ) {
-
-        continue;
-
-      }
-
-
-      /* ======================================================
-         READ HTML
-         ====================================================== */
-
-      const html =
-        await response.text();
-
-
-      if (!html) {
-
-        continue;
-
-      }
-
-
-      /* ======================================================
-         CHECK HTML SIZE
-         ====================================================== */
-
-      const htmlBytes =
-        new TextEncoder()
-          .encode(html)
-          .length;
-
-
-      if (
-        htmlBytes <=
-        MAX_HTML_BYTES
-      ) {
-
-        pageMap.set(
-          currentUrl,
-          html
-        );
-
-      }
-
-
-      /* ======================================================
-         FIND INTERNAL LINKS
-         ====================================================== */
-
-      const links =
-        extractLinks(
-          html,
-          new URL(currentUrl)
+      const sitemapMatches =
+        xml.matchAll(
+          /<sitemap>\s*[\s\S]*?<loc>\s*([^<]+)\s*<\/loc>\s*[\s\S]*?<\/sitemap>/gi
         );
 
 
       for (
-        const link
-        of links
+        const match of sitemapMatches
       ) {
 
-
-        if (
-          pageMap.size +
-          queue.length >=
-          MAX_PAGES
-        ) {
-
-          break;
-
-        }
+        const child =
+          normalizeUrl(
+            decodeXml(
+              match[1]
+            )
+          );
 
 
         if (
-          visited.has(link)
+          child &&
+          !processedSitemaps.has(
+            child
+          ) &&
+          sitemapQueue.length <
+            MAX_SITEMAPS
         ) {
 
-          continue;
+          sitemapQueue.push(
+            child
+          );
 
         }
-
-
-        visited.add(
-          link
-        );
-
-
-        queue.push(
-          link
-        );
 
       }
 
 
+      // ------------------------------------------------------
+      // URL entries
+      // ------------------------------------------------------
+
+      const urlMatches =
+        xml.matchAll(
+          /<url>\s*[\s\S]*?<loc>\s*([^<]+)\s*<\/loc>\s*[\s\S]*?<\/url>/gi
+        );
+
+
+      for (
+        const match of urlMatches
+      ) {
+
+        const page =
+          normalizeUrl(
+            decodeXml(
+              match[1]
+            )
+          );
+
+
+        if (
+          page &&
+          isSameHostname(
+            page,
+            hostname
+          ) &&
+          isProbablyHtmlUrl(
+            page
+          )
+        ) {
+
+          pages.add(
+            page
+          );
+
+        }
+
+      }
+
     } catch (error) {
 
-
       console.error(
-        "DISCOVERY ERROR:",
-        currentUrl,
-        error?.message ||
-        String(error)
+        "Sitemap failed:",
+        sitemapUrl,
+        error
       );
 
     }
@@ -1344,21 +918,1517 @@ async function discoverPages(
   }
 
 
-  return pageMap;
+  return Array.from(
+    pages
+  );
 
 }
 
 
-/* ============================================================
-   EXTRACT INTERNAL LINKS
-   ============================================================ */
+// ============================================================
+// FETCH HTML
+// ============================================================
 
-function extractLinks(
+async function fetchHtml(
+  url
+) {
+
+  try {
+
+    const controller =
+      new AbortController();
+
+
+    const timeout =
+      setTimeout(
+        () =>
+          controller.abort(),
+        FETCH_TIMEOUT_MS
+      );
+
+
+    const response =
+      await fetch(
+        url,
+        {
+          method: "GET",
+
+          redirect: "follow",
+
+          headers: {
+            "User-Agent":
+              "ReportliAI-Crawler/1.0",
+
+            "Accept":
+              "text/html,application/xhtml+xml"
+          },
+
+          signal:
+            controller.signal
+        }
+      );
+
+
+    clearTimeout(
+      timeout
+    );
+
+
+    if (!response.ok) {
+
+      return null;
+
+    }
+
+
+    const contentType =
+      response.headers.get(
+        "content-type"
+      ) || "";
+
+
+    if (
+      !contentType.includes(
+        "text/html"
+      ) &&
+      !contentType.includes(
+        "application/xhtml+xml"
+      )
+    ) {
+
+      return null;
+
+    }
+
+
+    const html =
+      await response.text();
+
+
+    if (
+      html.length >
+      MAX_HTML_SIZE
+    ) {
+
+      return html.substring(
+        0,
+        MAX_HTML_SIZE
+      );
+
+    }
+
+
+    return html;
+
+  } catch (error) {
+
+    console.error(
+      "HTML fetch failed:",
+      url,
+      error
+    );
+
+
+    return null;
+
+  }
+
+}
+
+
+// ============================================================
+// FETCH TEXT
+// ============================================================
+
+async function fetchText(
+  url
+) {
+
+  try {
+
+    const controller =
+      new AbortController();
+
+
+    const timeout =
+      setTimeout(
+        () =>
+          controller.abort(),
+        FETCH_TIMEOUT_MS
+      );
+
+
+    const response =
+      await fetch(
+        url,
+        {
+          method: "GET",
+
+          redirect: "follow",
+
+          headers: {
+            "User-Agent":
+              "ReportliAI-Crawler/1.0"
+          },
+
+          signal:
+            controller.signal
+        }
+      );
+
+
+    clearTimeout(
+      timeout
+    );
+
+
+    if (!response.ok) {
+      return null;
+    }
+
+
+    return await response.text();
+
+  } catch {
+
+    return null;
+
+  }
+
+}
+
+
+// ============================================================
+// EXTRACT WEBSITE DATA
+// ============================================================
+
+function extractWebsiteData(
+  html,
+  sourceUrl
+) {
+
+  const result = {};
+
+
+  // ----------------------------------------------------------
+  // PAGE TITLE
+  // ----------------------------------------------------------
+
+  const title =
+    extractFirst(
+      html,
+      /<title[^>]*>([\s\S]*?)<\/title>/i
+    );
+
+
+  if (title) {
+
+    result.page_title =
+      cleanText(
+        decodeHtmlEntities(
+          title
+        )
+      );
+
+  }
+
+
+  // ----------------------------------------------------------
+  // META DESCRIPTION
+  // ----------------------------------------------------------
+
+  const description =
+    extractMeta(
+      html,
+      "description"
+    );
+
+
+  if (description) {
+
+    result.page_description =
+      description;
+
+  }
+
+
+  // ----------------------------------------------------------
+  // OG TITLE
+  // ----------------------------------------------------------
+
+  const ogTitle =
+    extractMetaProperty(
+      html,
+      "og:title"
+    );
+
+
+  if (ogTitle) {
+
+    result.og_title =
+      ogTitle;
+
+  }
+
+
+  // ----------------------------------------------------------
+  // OG DESCRIPTION
+  // ----------------------------------------------------------
+
+  const ogDescription =
+    extractMetaProperty(
+      html,
+      "og:description"
+    );
+
+
+  if (ogDescription) {
+
+    result.og_description =
+      ogDescription;
+
+  }
+
+
+  // ----------------------------------------------------------
+  // CANONICAL URL
+  // ----------------------------------------------------------
+
+  const canonical =
+    extractCanonical(
+      html
+    );
+
+
+  if (canonical) {
+
+    result.canonical_url =
+      canonical;
+
+  }
+
+
+  // ----------------------------------------------------------
+  // HEADINGS
+  // ----------------------------------------------------------
+
+  const headings =
+    extractHeadings(
+      html
+    );
+
+
+  if (
+    headings.length > 0
+  ) {
+
+    result.headings =
+      headings;
+
+  }
+
+
+  // ----------------------------------------------------------
+  // JSON-LD / Schema.org
+  // ----------------------------------------------------------
+
+  const jsonLd =
+    extractJsonLd(
+      html
+    );
+
+
+  if (
+    jsonLd.length > 0
+  ) {
+
+    result.schema_org =
+      jsonLd;
+
+    // --------------------------------------------------------
+    // Pull useful business fields from Schema.org
+    // --------------------------------------------------------
+
+    extractSchemaFields(
+      jsonLd,
+      result
+    );
+
+  }
+
+
+  // ----------------------------------------------------------
+  // PHONE NUMBERS
+  // ----------------------------------------------------------
+
+  const phones =
+    extractPhones(
+      html
+    );
+
+
+  if (
+    phones.length > 0
+  ) {
+
+    result.phone =
+      unique(
+        phones
+      );
+
+  }
+
+
+  // ----------------------------------------------------------
+  // EMAIL ADDRESSES
+  // ----------------------------------------------------------
+
+  const emails =
+    extractEmails(
+      html
+    );
+
+
+  if (
+    emails.length > 0
+  ) {
+
+    result.email =
+      unique(
+        emails
+      );
+
+  }
+
+
+  // ----------------------------------------------------------
+  // OPENING HOURS
+  // ----------------------------------------------------------
+
+  const openingHours =
+    extractOpeningHours(
+      html
+    );
+
+
+  if (
+    openingHours.length > 0
+  ) {
+
+    result.opening_hours =
+      unique(
+        openingHours
+      );
+
+  }
+
+
+  // ----------------------------------------------------------
+  // SOCIAL LINKS
+  // ----------------------------------------------------------
+
+  const socialLinks =
+    extractSocialLinks(
+      html,
+      sourceUrl
+    );
+
+
+  if (
+    socialLinks.length > 0
+  ) {
+
+    result.social_links =
+      unique(
+        socialLinks
+      );
+
+  }
+
+
+  // ----------------------------------------------------------
+  // MAIN PAGE TEXT
+  // ----------------------------------------------------------
+
+  const text =
+    extractReadableText(
+      html
+    );
+
+
+  if (text) {
+
+    result.page_content =
+      text.substring(
+        0,
+        MAX_TEXT_LENGTH
+      );
+
+  }
+
+
+  return result;
+
+}
+
+
+// ============================================================
+// EXTRACT JSON-LD
+// ============================================================
+
+function extractJsonLd(
+  html
+) {
+
+  const scripts = [];
+
+
+  const regex =
+    /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+
+
+  let match;
+
+
+  while (
+    (match = regex.exec(html))
+  ) {
+
+    const raw =
+      match[1].trim();
+
+
+    if (!raw) {
+      continue;
+    }
+
+
+    try {
+
+      const parsed =
+        JSON.parse(
+          raw
+        );
+
+
+      if (
+        Array.isArray(
+          parsed
+        )
+      ) {
+
+        scripts.push(
+          ...parsed
+        );
+
+      } else {
+
+        scripts.push(
+          parsed
+        );
+
+      }
+
+    } catch {
+
+      // Some websites contain invalid JSON-LD.
+      // Ignore it instead of failing the page.
+
+    }
+
+  }
+
+
+  return scripts;
+
+}
+
+
+// ============================================================
+// EXTRACT SCHEMA FIELDS
+// ============================================================
+
+function extractSchemaFields(
+  jsonLd,
+  result
+) {
+
+  const objects =
+    flattenSchemaObjects(
+      jsonLd
+    );
+
+
+  for (
+    const object
+    of objects
+  ) {
+
+    const type =
+      getSchemaType(
+        object
+      );
+
+
+    // --------------------------------------------------------
+    // Business name
+    // --------------------------------------------------------
+
+    if (
+      !result.business_name &&
+      object.name &&
+      isBusinessSchemaType(
+        type
+      )
+    ) {
+
+      result.business_name =
+        cleanValue(
+          object.name
+        );
+
+    }
+
+
+    // --------------------------------------------------------
+    // Description
+    // --------------------------------------------------------
+
+    if (
+      !result.business_description &&
+      object.description
+    ) {
+
+      result.business_description =
+        cleanValue(
+          object.description
+        );
+
+    }
+
+
+    // --------------------------------------------------------
+    // Telephone
+    // --------------------------------------------------------
+
+    if (
+      !result.phone &&
+      object.telephone
+    ) {
+
+      result.phone =
+        [
+          cleanValue(
+            object.telephone
+          )
+        ];
+
+    }
+
+
+    // --------------------------------------------------------
+    // Email
+    // --------------------------------------------------------
+
+    if (
+      !result.email &&
+      object.email
+    ) {
+
+      result.email =
+        [
+          cleanValue(
+            object.email
+          )
+        ];
+
+    }
+
+
+    // --------------------------------------------------------
+    // Address
+    // --------------------------------------------------------
+
+    if (
+      !result.address &&
+      object.address
+    ) {
+
+      result.address =
+        normalizeAddress(
+          object.address
+        );
+
+    }
+
+
+    // --------------------------------------------------------
+    // URL
+    // --------------------------------------------------------
+
+    if (
+      !result.business_website &&
+      object.url
+    ) {
+
+      result.business_website =
+        cleanValue(
+          object.url
+        );
+
+    }
+
+
+    // --------------------------------------------------------
+    // Opening hours
+    // --------------------------------------------------------
+
+    if (
+      !result.opening_hours &&
+      object.openingHours
+    ) {
+
+      result.opening_hours =
+        cleanValue(
+          object.openingHours
+        );
+
+    }
+
+
+    // --------------------------------------------------------
+    // Price range
+    // --------------------------------------------------------
+
+    if (
+      !result.price_range &&
+      object.priceRange
+    ) {
+
+      result.price_range =
+        cleanValue(
+          object.priceRange
+        );
+
+    }
+
+
+    // --------------------------------------------------------
+    // Services
+    // --------------------------------------------------------
+
+    if (
+      !result.services &&
+      object.hasOfferCatalog
+    ) {
+
+      result.services =
+        extractOfferCatalog(
+          object.hasOfferCatalog
+        );
+
+    }
+
+
+    // --------------------------------------------------------
+    // Products
+    // --------------------------------------------------------
+
+    if (
+      !result.products &&
+      object.itemListElement
+    ) {
+
+      const products =
+        extractItems(
+          object.itemListElement
+        );
+
+
+      if (
+        products.length > 0
+      ) {
+
+        result.products =
+          products;
+
+      }
+
+    }
+
+  }
+
+}
+
+
+// ============================================================
+// FLATTEN SCHEMA OBJECTS
+// ============================================================
+
+function flattenSchemaObjects(
+  input
+) {
+
+  const result = [];
+
+
+  function walk(value) {
+
+    if (!value) {
+      return;
+    }
+
+
+    if (
+      Array.isArray(
+        value
+      )
+    ) {
+
+      for (
+        const item
+        of value
+      ) {
+
+        walk(item);
+
+      }
+
+      return;
+
+    }
+
+
+    if (
+      typeof value !==
+      "object"
+    ) {
+
+      return;
+
+    }
+
+
+    result.push(
+      value
+    );
+
+
+    if (
+      value["@graph"]
+    ) {
+
+      walk(
+        value["@graph"]
+      );
+
+    }
+
+  }
+
+
+  walk(
+    input
+  );
+
+
+  return result;
+
+}
+
+
+// ============================================================
+// SCHEMA TYPE
+// ============================================================
+
+function getSchemaType(
+  object
+) {
+
+  const type =
+    object?.["@type"];
+
+
+  if (
+    Array.isArray(
+      type
+    )
+  ) {
+
+    return type.join(
+      ","
+    );
+
+  }
+
+
+  return String(
+    type || ""
+  );
+
+}
+
+
+// ============================================================
+// BUSINESS SCHEMA TYPE
+// ============================================================
+
+function isBusinessSchemaType(
+  type
+) {
+
+  const value =
+    String(
+      type
+    ).toLowerCase();
+
+
+  return (
+    value.includes(
+      "business"
+    ) ||
+    value.includes(
+      "organization"
+    ) ||
+    value.includes(
+      "restaurant"
+    ) ||
+    value.includes(
+      "medicalorganization"
+    ) ||
+    value.includes(
+      "localbusiness"
+    ) ||
+    value.includes(
+      "store"
+    ) ||
+    value.includes(
+      "clinic"
+    ) ||
+    value.includes(
+      "dentist"
+    ) ||
+    value.includes(
+      "physician"
+    )
+  );
+
+}
+
+
+// ============================================================
+// NORMALIZE ADDRESS
+// ============================================================
+
+function normalizeAddress(
+  address
+) {
+
+  if (
+    typeof address ===
+    "string"
+  ) {
+
+    return address;
+
+  }
+
+
+  if (
+    typeof address !==
+    "object"
+  ) {
+
+    return null;
+
+  }
+
+
+  const parts = [
+    address.streetAddress,
+    address.addressLocality,
+    address.addressRegion,
+    address.postalCode,
+    address.addressCountry
+  ]
+  .filter(Boolean);
+
+
+  return parts.join(
+    ", "
+  );
+
+}
+
+
+// ============================================================
+// EXTRACT OFFER CATALOG
+// ============================================================
+
+function extractOfferCatalog(
+  catalog
+) {
+
+  const results = [];
+
+
+  function walk(value) {
+
+    if (!value) {
+      return;
+    }
+
+
+    if (
+      Array.isArray(
+        value
+      )
+    ) {
+
+      for (
+        const item
+        of value
+      ) {
+
+        walk(item);
+
+      }
+
+      return;
+
+    }
+
+
+    if (
+      typeof value !==
+      "object"
+    ) {
+
+      return;
+
+    }
+
+
+    if (
+      value.name
+    ) {
+
+      results.push(
+        {
+          name:
+            cleanValue(
+              value.name
+            ),
+
+          description:
+            cleanValue(
+              value.description
+            ),
+
+          price:
+            cleanValue(
+              value.price
+            )
+        }
+      );
+
+    }
+
+
+    if (
+      value.itemListElement
+    ) {
+
+      walk(
+        value.itemListElement
+      );
+
+    }
+
+
+    if (
+      value.hasOfferCatalog
+    ) {
+
+      walk(
+        value.hasOfferCatalog
+      );
+
+    }
+
+  }
+
+
+  walk(
+    catalog
+  );
+
+
+  return results;
+
+}
+
+
+// ============================================================
+// EXTRACT ITEMS
+// ============================================================
+
+function extractItems(
+  items
+) {
+
+  const results = [];
+
+
+  if (
+    !Array.isArray(
+      items
+    )
+  ) {
+
+    return results;
+
+  }
+
+
+  for (
+    const item
+    of items
+  ) {
+
+    const value =
+      item?.item ||
+      item;
+
+
+    if (
+      value &&
+      typeof value ===
+      "object"
+    ) {
+
+      results.push(
+        {
+          name:
+            cleanValue(
+              value.name
+            ),
+
+          description:
+            cleanValue(
+              value.description
+            ),
+
+          url:
+            cleanValue(
+              value.url
+            )
+        }
+      );
+
+    }
+
+  }
+
+
+  return results;
+
+}
+
+
+// ============================================================
+// EXTRACT META
+// ============================================================
+
+function extractMeta(
+  html,
+  name
+) {
+
+  const regex =
+    new RegExp(
+      `<meta[^>]+name=["']${escapeRegex(name)}["'][^>]+content=["']([^"']*)["'][^>]*>`,
+      "i"
+    );
+
+
+  const reverseRegex =
+    new RegExp(
+      `<meta[^>]+content=["']([^"']*)["'][^>]+name=["']${escapeRegex(name)}["'][^>]*>`,
+      "i"
+    );
+
+
+  const match =
+    html.match(
+      regex
+    ) ||
+    html.match(
+      reverseRegex
+    );
+
+
+  return match
+    ? cleanText(
+        decodeHtmlEntities(
+          match[1]
+        )
+      )
+    : null;
+
+}
+
+
+// ============================================================
+// EXTRACT OG META
+// ============================================================
+
+function extractMetaProperty(
+  html,
+  property
+) {
+
+  const regex =
+    new RegExp(
+      `<meta[^>]+property=["']${escapeRegex(property)}["'][^>]+content=["']([^"']*)["'][^>]*>`,
+      "i"
+    );
+
+
+  const reverseRegex =
+    new RegExp(
+      `<meta[^>]+content=["']([^"']*)["'][^>]+property=["']${escapeRegex(property)}["'][^>]*>`,
+      "i"
+    );
+
+
+  const match =
+    html.match(
+      regex
+    ) ||
+    html.match(
+      reverseRegex
+    );
+
+
+  return match
+    ? cleanText(
+        decodeHtmlEntities(
+          match[1]
+        )
+      )
+    : null;
+
+}
+
+
+// ============================================================
+// EXTRACT CANONICAL
+// ============================================================
+
+function extractCanonical(
+  html
+) {
+
+  const regex =
+    /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["'][^>]*>/i;
+
+
+  const reverseRegex =
+    /<link[^>]+href=["']([^"']+)["'][^>]+rel=["']canonical["'][^>]*>/i;
+
+
+  const match =
+    html.match(
+      regex
+    ) ||
+    html.match(
+      reverseRegex
+    );
+
+
+  return match
+    ? match[1]
+    : null;
+
+}
+
+
+// ============================================================
+// EXTRACT HEADINGS
+// ============================================================
+
+function extractHeadings(
+  html
+) {
+
+  const headings = [];
+
+
+  const regex =
+    /<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi;
+
+
+  let match;
+
+
+  while (
+    (match = regex.exec(html))
+  ) {
+
+    const text =
+      cleanText(
+        stripTags(
+          match[2]
+        )
+      );
+
+
+    if (text) {
+
+      headings.push(
+        {
+          level:
+            Number(
+              match[1]
+            ),
+
+          text:
+            text
+        }
+      );
+
+    }
+
+  }
+
+
+  return headings;
+
+}
+
+
+// ============================================================
+// EXTRACT PHONE NUMBERS
+// ============================================================
+
+function extractPhones(
+  html
+) {
+
+  const text =
+    decodeHtmlEntities(
+      stripTags(
+        html
+      )
+    );
+
+
+  const matches =
+    text.match(
+      /(?:\+?\d[\d\s().-]{7,}\d)/g
+    ) || [];
+
+
+  return matches
+    .map(
+      phone =>
+        phone
+          .replace(
+            /\s+/g,
+            " "
+          )
+          .trim()
+    )
+    .filter(
+      phone =>
+        phone.replace(
+          /\D/g,
+          ""
+        ).length >= 8
+    );
+
+}
+
+
+// ============================================================
+// EXTRACT EMAILS
+// ============================================================
+
+function extractEmails(
+  html
+) {
+
+  const text =
+    decodeHtmlEntities(
+      html
+    );
+
+
+  const matches =
+    text.match(
+      /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi
+    ) || [];
+
+
+  return matches.map(
+    email =>
+      email.toLowerCase()
+  );
+
+}
+
+
+// ============================================================
+// EXTRACT OPENING HOURS
+// ============================================================
+
+function extractOpeningHours(
+  html
+) {
+
+  const text =
+    cleanText(
+      stripTags(
+        decodeHtmlEntities(
+          html
+        )
+      )
+    );
+
+
+  const results = [];
+
+
+  const dayPattern =
+    "(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Mon|Tue|Wed|Thu|Fri|Sat|Sun)";
+
+
+  const regex =
+    new RegExp(
+      `${dayPattern}[\\s:-]{0,5}(?:[A-Za-z]+\\s+)?\\d{1,2}(?::\\d{2})?\\s*(?:AM|PM|am|pm)?\\s*(?:-|–|to)\\s*\\d{1,2}(?::\\d{2})?\\s*(?:AM|PM|am|pm)?`,
+      "gi"
+    );
+
+
+  let match;
+
+
+  while (
+    (match = regex.exec(text))
+  ) {
+
+    results.push(
+      match[0]
+    );
+
+  }
+
+
+  return results;
+
+}
+
+
+// ============================================================
+// EXTRACT SOCIAL LINKS
+// ============================================================
+
+function extractSocialLinks(
+  html,
+  sourceUrl
+) {
+
+  const links =
+    extractAllLinks(
+      html,
+      sourceUrl
+    );
+
+
+  const socialDomains = [
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "twitter.com",
+    "x.com",
+    "youtube.com",
+    "tiktok.com",
+    "threads.net",
+    "wa.me",
+    "whatsapp.com"
+  ];
+
+
+  return links.filter(
+    link => {
+
+      try {
+
+        const hostname =
+          new URL(
+            link
+          ).hostname.toLowerCase();
+
+
+        return socialDomains.some(
+          domain =>
+            hostname === domain ||
+            hostname.endsWith(
+              "." + domain
+            )
+        );
+
+      } catch {
+
+        return false;
+
+      }
+
+    }
+  );
+
+}
+
+
+// ============================================================
+// EXTRACT INTERNAL LINKS
+// ============================================================
+
+function extractInternalLinks(
+  html,
+  currentUrl,
+  hostname
+) {
+
+  return extractAllLinks(
+    html,
+    currentUrl
+  )
+  .filter(
+    link =>
+      isSameHostname(
+        link,
+        hostname
+      )
+  )
+  .filter(
+    isProbablyHtmlUrl
+  );
+
+}
+
+
+// ============================================================
+// EXTRACT ALL LINKS
+// ============================================================
+
+function extractAllLinks(
   html,
   currentUrl
 ) {
 
-  const links =
+  const results =
     new Set();
 
 
@@ -1371,55 +2441,45 @@ function extractLinks(
 
   while (
     (match = regex.exec(html))
-    !== null
   ) {
-
 
     const href =
       match[1];
 
 
-    if (!href) {
-
-      continue;
-
-    }
-
-
-    /* ========================================================
-       IGNORE SPECIAL LINKS
-       ======================================================== */
-
-    if (
-      href.startsWith("#") ||
-      href.startsWith("javascript:") ||
-      href.startsWith("mailto:") ||
-      href.startsWith("tel:")
-    ) {
-
-      continue;
-
-    }
-
-
     try {
 
+      if (
+        href.startsWith(
+          "#"
+        ) ||
+        href.startsWith(
+          "mailto:"
+        ) ||
+        href.startsWith(
+          "tel:"
+        ) ||
+        href.startsWith(
+          "javascript:"
+        )
+      ) {
 
-      const absoluteUrl =
+        continue;
+
+      }
+
+
+      const absolute =
         new URL(
           href,
           currentUrl
         );
 
 
-      /* ======================================================
-         HTTP / HTTPS
-         ====================================================== */
-
       if (
-        absoluteUrl.protocol !==
+        absolute.protocol !==
           "http:" &&
-        absoluteUrl.protocol !==
+        absolute.protocol !==
           "https:"
       ) {
 
@@ -1428,66 +2488,51 @@ function extractLinks(
       }
 
 
-      /* ======================================================
-         SAME WEBSITE ONLY
-         ====================================================== */
+      absolute.hash =
+        "";
 
-      if (
-        !sameHostname(
-          currentUrl,
-          absoluteUrl
-        )
+
+      // ------------------------------------------------------
+      // Remove tracking parameters
+      // ------------------------------------------------------
+
+      const tracking =
+        [
+          "utm_source",
+          "utm_medium",
+          "utm_campaign",
+          "utm_term",
+          "utm_content",
+          "fbclid",
+          "gclid"
+        ];
+
+
+      for (
+        const parameter
+        of tracking
       ) {
 
-        continue;
+        absolute.searchParams.delete(
+          parameter
+        );
 
       }
 
-
-      /* ======================================================
-         BLOCKED HOSTS
-         ====================================================== */
-
-      if (
-        isBlockedHostname(
-          absoluteUrl.hostname
-        )
-      ) {
-
-        continue;
-
-      }
-
-
-      /* ======================================================
-         IGNORE FILES
-         ====================================================== */
-
-      if (
-        isLikelyFile(
-          absoluteUrl.pathname
-        )
-      ) {
-
-        continue;
-
-      }
-
-
-      /* ======================================================
-         NORMALIZE
-         ====================================================== */
 
       const normalized =
         normalizeUrl(
-          absoluteUrl.href
+          absolute.href
         );
 
 
-      links.add(
-        normalized
-      );
+      if (normalized) {
 
+        results.add(
+          normalized
+        );
+
+      }
 
     } catch {
 
@@ -1499,17 +2544,17 @@ function extractLinks(
 
 
   return Array.from(
-    links
+    results
   );
 
 }
 
 
-/* ============================================================
-   EXTRACT READABLE TEXT
-   ============================================================ */
+// ============================================================
+// EXTRACT READABLE TEXT
+// ============================================================
 
-function extractText(
+function extractReadableText(
   html
 ) {
 
@@ -1517,10 +2562,7 @@ function extractText(
     html;
 
 
-  /* ==========================================================
-     REMOVE SCRIPT
-     ========================================================== */
-
+  // Remove scripts.
   text =
     text.replace(
       /<script[\s\S]*?<\/script>/gi,
@@ -1528,10 +2570,7 @@ function extractText(
     );
 
 
-  /* ==========================================================
-     REMOVE STYLE
-     ========================================================== */
-
+  // Remove styles.
   text =
     text.replace(
       /<style[\s\S]*?<\/style>/gi,
@@ -1539,21 +2578,7 @@ function extractText(
     );
 
 
-  /* ==========================================================
-     REMOVE NOSCRIPT
-     ========================================================== */
-
-  text =
-    text.replace(
-      /<noscript[\s\S]*?<\/noscript>/gi,
-      " "
-    );
-
-
-  /* ==========================================================
-     REMOVE SVG
-     ========================================================== */
-
+  // Remove SVG.
   text =
     text.replace(
       /<svg[\s\S]*?<\/svg>/gi,
@@ -1561,10 +2586,23 @@ function extractText(
     );
 
 
-  /* ==========================================================
-     REMOVE HTML TAGS
-     ========================================================== */
+  // Remove noscript.
+  text =
+    text.replace(
+      /<noscript[\s\S]*?<\/noscript>/gi,
+      " "
+    );
 
+
+  // Remove comments.
+  text =
+    text.replace(
+      /<!--[\s\S]*?-->/g,
+      " "
+    );
+
+
+  // Remove tags.
   text =
     text.replace(
       /<[^>]+>/g,
@@ -1572,20 +2610,14 @@ function extractText(
     );
 
 
-  /* ==========================================================
-     DECODE ENTITIES
-     ========================================================== */
-
+  // Decode entities.
   text =
     decodeHtmlEntities(
       text
     );
 
 
-  /* ==========================================================
-     CLEAN WHITESPACE
-     ========================================================== */
-
+  // Normalize whitespace.
   text =
     text.replace(
       /\s+/g,
@@ -1598,678 +2630,95 @@ function extractText(
 }
 
 
-/* ============================================================
-   SEND ONE PAGE TO SARVAM
-   ============================================================ */
+// ============================================================
+// SAVE EXTRACTED DATA
+// ============================================================
 
-async function extractBusinessDataWithSarvam(
+async function saveExtractedData(
   env,
-  pageUrl,
-  pageText
+  applicationId,
+  sourceUrl,
+  extracted
 ) {
 
-
-  const systemPrompt = `
-
-You are a website information extraction system for Reportli AI.
-
-You receive ONE webpage at a time.
-
-Your job is to extract useful factual business information
-from that webpage.
-
-IMPORTANT RULES:
-
-1. Only extract information that is actually present.
-2. Never invent information.
-3. Never guess missing information.
-4. If useful business information is not present, return:
-   {"fields":[]}
-5. Use short reusable field names.
-6. Field names must describe the information.
-7. Extract information useful for AI employees.
-8. Useful information includes:
-   - business_name
-   - business_description
-   - address
-   - phone
-   - email
-   - opening_hours
-   - services
-   - products
-   - pricing
-   - faq
-   - about
-   - contact_information
-   - appointment_information
-   - cancellation_policy
-   - refund_policy
-   - privacy_policy
-   - terms
-   - payment_information
-   - delivery_information
-   - service_area
-   - social_links
-   - doctors
-   - treatments
-   - facilities
-   - insurance
-   - emergency_information
-9. Do not extract:
-   - navigation menus
-   - cookie banners
-   - tracking information
-   - unrelated technical information
-   - footer copyright text
-10. If there are multiple services, products,
-    doctors, FAQs, etc., use arrays when appropriate.
-11. Preserve important factual information.
-12. Do not use markdown.
-13. Return ONLY JSON.
-14. The exact response format is:
-
-{
-  "fields": [
-    {
-      "field": "business_name",
-      "data": "Example Business"
-    }
-  ]
-}
-
-15. No explanation.
-16. No code fences.
-17. No text before or after the JSON.
-
-`;
+  let saved = 0;
 
 
-  const userPrompt = `
-
-SOURCE URL:
-${pageUrl}
-
-WEBPAGE TEXT:
-${pageText}
-
-`;
-
-
-  const baseRequestBody = {
-
-    model:
-      SARVAM_MODEL,
-
-    messages: [
-
-      {
-        role:
-          "system",
-
-        content:
-          systemPrompt
-      },
-
-      {
-        role:
-          "user",
-
-        content:
-          userPrompt
-      }
-
-    ],
-
-    temperature:
-      0,
-
-    max_tokens:
-      3000
-
-  };
-
-
-  /* ==========================================================
-     FIRST TRY: JSON SCHEMA
-     ========================================================== */
-
-  const strictRequestBody = {
-
-    ...baseRequestBody,
-
-    response_format: {
-
-      type:
-        "json_schema",
-
-      json_schema: {
-
-        name:
-          "business_information",
-
-        strict:
-          true,
-
-        schema: {
-
-          type:
-            "object",
-
-          additionalProperties:
-            false,
-
-          properties: {
-
-            fields: {
-
-              type:
-                "array",
-
-              items: {
-
-                type:
-                  "object",
-
-                additionalProperties:
-                  false,
-
-                properties: {
-
-                  field: {
-                    type:
-                      "string"
-                  },
-
-                  data: {}
-
-                },
-
-                required: [
-                  "field",
-                  "data"
-                ]
-
-              }
-
-            }
-
-          },
-
-          required: [
-            "fields"
-          ]
-
-        }
-
-      }
-
-    }
-
-  };
-
-
-  let result =
-    await callSarvam(
-      env,
-      strictRequestBody
-    );
-
-
-  /* ==========================================================
-     FALLBACK WITHOUT JSON SCHEMA
-     ========================================================== */
-
-  if (
-    !result.success
+  for (
+    const [field, value]
+    of Object.entries(
+      extracted
+    )
   ) {
 
-    console.log(
-      "Sarvam JSON schema request failed."
-    );
-
-    console.log(
-      "Retrying without response_format..."
-    );
-
-
-    result =
-      await callSarvam(
-        env,
-        baseRequestBody
-      );
-
-  }
-
-
-  return result;
-
-}
-
-
-/* ============================================================
-   SARVAM REQUEST
-   ============================================================ */
-
-async function callSarvam(
-  env,
-  requestBody
-) {
-
-  try {
-
-
-    /* ========================================================
-       CHECK SUBREQUEST LIMIT
-       ======================================================== */
-
     if (
-      nearSubrequestLimit()
+      value === undefined ||
+      value === null
     ) {
 
-      return {
-        success:
-          false,
-
-        error:
-          "Cloudflare subrequest safety limit reached."
-      };
+      continue;
 
     }
-
-
-    trackSubrequest();
-
-
-    /* ========================================================
-       CALL SARVAM
-       ======================================================== */
-
-    const response =
-      await fetch(
-        SARVAM_API_URL,
-        {
-          method:
-            "POST",
-
-          headers: {
-
-            "Content-Type":
-              "application/json",
-
-            "api-subscription-key":
-              env.SARVAM_API_KEY
-
-          },
-
-          body:
-            JSON.stringify(
-              requestBody
-            )
-
-        }
-      );
-
-
-    const responseText =
-      await response.text();
-
-
-    console.log(
-      "SARVAM STATUS:",
-      response.status
-    );
-
-
-    /* ========================================================
-       API ERROR
-       ======================================================== */
-
-    if (
-      !response.ok
-    ) {
-
-      console.error(
-        "SARVAM ERROR:",
-        responseText
-      );
-
-
-      return {
-
-        success:
-          false,
-
-        error:
-          `Sarvam API returned ${response.status}: ${responseText}`
-
-      };
-
-    }
-
-
-    /* ========================================================
-       PARSE SARVAM RESPONSE
-       ======================================================== */
-
-    let result;
-
-
-    try {
-
-      result =
-        JSON.parse(
-          responseText
-        );
-
-    } catch {
-
-      return {
-
-        success:
-          false,
-
-        error:
-          "Sarvam returned invalid JSON."
-
-      };
-
-    }
-
-
-    /* ========================================================
-       GET MODEL CONTENT
-       ======================================================== */
-
-    const content =
-      result
-        ?.choices?.[0]
-        ?.message
-        ?.content;
-
-
-    if (!content) {
-
-      return {
-
-        success:
-          false,
-
-        error:
-          "Sarvam response did not contain message.content."
-
-      };
-
-    }
-
-
-    /* ========================================================
-       PARSE MODEL JSON
-       ======================================================== */
-
-    const parsed =
-      extractJsonFromModelContent(
-        content
-      );
 
 
     if (
-      !parsed ||
-      !Array.isArray(
-        parsed.fields
-      )
+      typeof value ===
+      "string" &&
+      !value.trim()
     ) {
 
-      console.error(
-        "INVALID SARVAM CONTENT:",
-        content
-      );
-
-
-      return {
-
-        success:
-          false,
-
-        error:
-          "Sarvam response did not contain a valid fields array."
-
-      };
+      continue;
 
     }
 
 
-    return {
+    // --------------------------------------------------------
+    // Do not store the entire schema JSON as one enormous field
+    // if it is empty.
+    // --------------------------------------------------------
 
-      success:
-        true,
+    const payload = {
 
-      fields:
-        parsed.fields
+      application_id:
+        applicationId,
+
+      field:
+        field,
+
+      data:
+        value,
+
+      source_url:
+        sourceUrl,
+
+      updated_at:
+        new Date().toISOString()
 
     };
 
-
-  } catch (error) {
-
-
-    console.error(
-      "SARVAM REQUEST ERROR:",
-      error
-    );
-
-
-    return {
-
-      success:
-        false,
-
-      error:
-        error?.message ||
-        String(error)
-
-    };
-
-  }
-
-}
-
-
-/* ============================================================
-   EXTRACT JSON FROM MODEL RESPONSE
-   ============================================================ */
-
-function extractJsonFromModelContent(
-  content
-) {
-
-
-  /* ==========================================================
-     ALREADY AN OBJECT
-     ========================================================== */
-
-  if (
-    typeof content ===
-      "object" &&
-    content !== null
-  ) {
-
-    return content;
-
-  }
-
-
-  if (
-    typeof content !==
-    "string"
-  ) {
-
-    return null;
-
-  }
-
-
-  const cleaned =
-    content.trim();
-
-
-  /* ==========================================================
-     DIRECT JSON
-     ========================================================== */
-
-  try {
-
-    return JSON.parse(
-      cleaned
-    );
-
-  } catch {
-
-    // Continue.
-
-  }
-
-
-  /* ==========================================================
-     JSON CODE FENCE
-     ========================================================== */
-
-  const fenceMatch =
-    cleaned.match(
-      /```(?:json)?\s*([\s\S]*?)```/i
-    );
-
-
-  if (
-    fenceMatch
-  ) {
-
-    try {
-
-      return JSON.parse(
-        fenceMatch[1].trim()
-      );
-
-    } catch {
-
-      // Continue.
-
-    }
-
-  }
-
-
-  /* ==========================================================
-     FIND FIRST JSON OBJECT
-     ========================================================== */
-
-  const start =
-    cleaned.indexOf(
-      "{"
-    );
-
-
-  const end =
-    cleaned.lastIndexOf(
-      "}"
-    );
-
-
-  if (
-    start !== -1 &&
-    end !== -1 &&
-    end > start
-  ) {
-
-    try {
-
-      return JSON.parse(
-        cleaned.slice(
-          start,
-          end + 1
-        )
-      );
-
-    } catch {
-
-      return null;
-
-    }
-
-  }
-
-
-  return null;
-
-}
-
-
-/* ============================================================
-   SAVE BUSINESS DATA
-   ============================================================ */
-
-async function saveBusinessData(
-  env,
-  data
-) {
-
-  try {
-
-
-    /* ========================================================
-       CHECK SUBREQUEST LIMIT
-       ======================================================== */
-
-    if (
-      nearSubrequestLimit()
-    ) {
-
-      return {
-
-        success:
-          false,
-
-        error:
-          "Cloudflare subrequest safety limit reached before Supabase save."
-
-      };
-
-    }
-
-
-    /* ========================================================
-       SUPABASE REST URL
-       ======================================================== */
 
     const url =
-      `${env.SUPABASE_URL}/rest/v1/business_data` +
+      `${env.SUPABASE_URL}` +
+      `/rest/v1/business_data` +
       `?on_conflict=application_id,field`;
 
-
-    trackSubrequest();
-
-
-    /* ========================================================
-       UPSERT
-       ======================================================== */
 
     const response =
       await fetch(
         url,
         {
-
-          method:
-            "POST",
+          method: "POST",
 
           headers: {
+
+            "Content-Type":
+              "application/json",
 
             "apikey":
               env.SUPABASE_SECRET_KEY,
 
             "Authorization":
               `Bearer ${env.SUPABASE_SECRET_KEY}`,
-
-            "Content-Type":
-              "application/json",
 
             "Prefer":
               "resolution=merge-duplicates,return=minimal"
@@ -2278,117 +2727,445 @@ async function saveBusinessData(
 
           body:
             JSON.stringify(
-              data
+              payload
             )
-
         }
       );
 
 
-    const responseText =
-      await response.text();
-
-
-    /* ========================================================
-       ERROR
-       ======================================================== */
-
-    if (
-      !response.ok
-    ) {
+    if (!response.ok) {
 
       console.error(
-        "SUPABASE BUSINESS_DATA ERROR:",
-        response.status,
-        responseText
+        "Supabase save failed:",
+        field,
+        await response.text()
       );
 
 
-      let hint =
-        "";
-
-
-      if (
-        responseText.includes(
-          "42P10"
-        ) ||
-        responseText
-          .toLowerCase()
-          .includes(
-            "no unique or exclusion constraint"
-          )
-      ) {
-
-        hint =
-          " You need a UNIQUE constraint on " +
-          "(application_id, field) in business_data.";
-
-      }
-
-
-      return {
-
-        success:
-          false,
-
-        error:
-          `Supabase returned ${response.status}: ${responseText}${hint}`
-
-      };
+      continue;
 
     }
 
 
-    console.log(
-      "SAVED:",
-      data.field
-    );
+    saved++;
+
+  }
 
 
-    return {
+  return saved;
 
-      success:
-        true
-
-    };
+}
 
 
-  } catch (error) {
+// ============================================================
+// URL NORMALIZATION
+// ============================================================
+
+function normalizeUrl(
+  input
+) {
+
+  try {
+
+    let value =
+      String(
+        input
+      ).trim();
 
 
-    console.error(
-      "SUPABASE SAVE ERROR:",
-      error
-    );
+    if (
+      !value.startsWith(
+        "http://"
+      ) &&
+      !value.startsWith(
+        "https://"
+      )
+    ) {
+
+      value =
+        "https://" +
+        value;
+
+    }
 
 
-    return {
+    const url =
+      new URL(
+        value
+      );
 
-      success:
-        false,
 
-      error:
-        error?.message ||
-        String(error)
+    if (
+      url.protocol !==
+        "http:" &&
+      url.protocol !==
+        "https:"
+    ) {
 
-    };
+      return null;
+
+    }
+
+
+    url.hash =
+      "";
+
+
+    const tracking =
+      [
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "fbclid",
+        "gclid"
+      ];
+
+
+    for (
+      const parameter
+      of tracking
+    ) {
+
+      url.searchParams.delete(
+        parameter
+      );
+
+    }
+
+
+    if (
+      url.pathname !==
+      "/"
+    ) {
+
+      url.pathname =
+        url.pathname.replace(
+          /\/+$/,
+          ""
+        );
+
+    }
+
+
+    return url.href;
+
+  } catch {
+
+    return null;
 
   }
 
 }
 
 
-/* ============================================================
-   NORMALIZE FIELD NAME
-   ============================================================ */
+// ============================================================
+// SAME HOSTNAME
+// ============================================================
 
-function normalizeFieldName(
-  field
+function isSameHostname(
+  url,
+  hostname
+) {
+
+  try {
+
+    return (
+      new URL(
+        url
+      ).hostname.toLowerCase() ===
+      hostname.toLowerCase()
+    );
+
+  } catch {
+
+    return false;
+
+  }
+
+}
+
+
+// ============================================================
+// HTML URL CHECK
+// ============================================================
+
+function isProbablyHtmlUrl(
+  url
+) {
+
+  try {
+
+    const pathname =
+      new URL(
+        url
+      ).pathname.toLowerCase();
+
+
+    const ignoredExtensions = [
+
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".gif",
+      ".webp",
+      ".svg",
+      ".ico",
+
+      ".pdf",
+
+      ".zip",
+
+      ".rar",
+
+      ".7z",
+
+      ".mp3",
+      ".mp4",
+      ".wav",
+      ".avi",
+      ".mov",
+
+      ".css",
+      ".js",
+
+      ".json",
+
+      ".xml",
+
+      ".csv",
+
+      ".doc",
+      ".docx",
+      ".xls",
+      ".xlsx",
+      ".ppt",
+      ".pptx",
+
+      ".woff",
+      ".woff2",
+      ".ttf",
+      ".eot"
+
+    ];
+
+
+    return !ignoredExtensions.some(
+      extension =>
+        pathname.endsWith(
+          extension
+        )
+    );
+
+  } catch {
+
+    return false;
+
+  }
+
+}
+
+
+// ============================================================
+// SSRF PROTECTION
+// ============================================================
+
+function isSafePublicUrl(
+  urlString
+) {
+
+  try {
+
+    const url =
+      new URL(
+        urlString
+      );
+
+
+    const hostname =
+      url.hostname.toLowerCase();
+
+
+    // --------------------------------------------------------
+    // Localhost
+    // --------------------------------------------------------
+
+    if (
+      hostname ===
+        "localhost" ||
+      hostname ===
+        "localhost.localdomain"
+    ) {
+
+      return false;
+
+    }
+
+
+    // --------------------------------------------------------
+    // Local domains
+    // --------------------------------------------------------
+
+    if (
+      hostname.endsWith(
+        ".local"
+      ) ||
+      hostname.endsWith(
+        ".internal"
+      )
+    ) {
+
+      return false;
+
+    }
+
+
+    // --------------------------------------------------------
+    // IPv4
+    // --------------------------------------------------------
+
+    const parts =
+      hostname.split(".");
+
+
+    if (
+      parts.length === 4 &&
+      parts.every(
+        part =>
+          /^\d+$/.test(
+            part
+          )
+      )
+    ) {
+
+      const [
+        a,
+        b
+      ] =
+        parts.map(
+          Number
+        );
+
+
+      // 10.0.0.0/8
+      if (
+        a === 10
+      ) {
+
+        return false;
+
+      }
+
+
+      // 127.0.0.0/8
+      if (
+        a === 127
+      ) {
+
+        return false;
+
+      }
+
+
+      // 172.16.0.0/12
+      if (
+        a === 172 &&
+        b >= 16 &&
+        b <= 31
+      ) {
+
+        return false;
+
+      }
+
+
+      // 192.168.0.0/16
+      if (
+        a === 192 &&
+        b === 168
+      ) {
+
+        return false;
+
+      }
+
+
+      // 169.254.0.0/16
+      if (
+        a === 169 &&
+        b === 254
+      ) {
+
+        return false;
+
+      }
+
+
+      // 0.0.0.0/8
+      if (
+        a === 0
+      ) {
+
+        return false;
+
+      }
+
+    }
+
+
+    return true;
+
+  } catch {
+
+    return false;
+
+  }
+
+}
+
+
+// ============================================================
+// HTML / TEXT HELPERS
+// ============================================================
+
+function stripTags(
+  value
+) {
+
+  return String(
+    value || ""
+  ).replace(
+    /<[^>]*>/g,
+    " "
+  );
+
+}
+
+
+function cleanText(
+  value
+) {
+
+  return String(
+    value || ""
+  )
+  .replace(
+    /\s+/g,
+    " "
+  )
+  .trim();
+
+}
+
+
+function cleanValue(
+  value
 ) {
 
   if (
-    typeof field !==
-    "string"
+    value === null ||
+    value === undefined
   ) {
 
     return null;
@@ -2396,372 +3173,138 @@ function normalizeFieldName(
   }
 
 
-  let value =
-    field
-      .trim()
-      .toLowerCase();
-
-
-  value =
-    value.replace(
-      /[\s-]+/g,
-      "_"
-    );
-
-
-  value =
-    value.replace(
-      /[^a-z0-9_]/g,
-      ""
-    );
-
-
-  value =
-    value.slice(
-      0,
-      100
-    );
-
-
-  return (
-    value ||
-    null
-  );
-
-}
-
-
-/* ============================================================
-   NORMALIZE URL
-   ============================================================ */
-
-function normalizeUrl(
-  url
-) {
-
-  const parsed =
-    new URL(
-      url
-    );
-
-
-  /* ==========================================================
-     REMOVE HASH
-     ========================================================== */
-
-  parsed.hash =
-    "";
-
-
-  /* ==========================================================
-     REMOVE TRACKING PARAMETERS
-     ========================================================== */
-
-  const trackingParameters = [
-
-    "utm_source",
-
-    "utm_medium",
-
-    "utm_campaign",
-
-    "utm_term",
-
-    "utm_content",
-
-    "fbclid",
-
-    "gclid"
-
-  ];
-
-
-  for (
-    const parameter
-    of trackingParameters
-  ) {
-
-    parsed.searchParams.delete(
-      parameter
-    );
-
-  }
-
-
-  /* ==========================================================
-     REMOVE TRAILING SLASH
-     ========================================================== */
-
   if (
-    parsed.pathname !==
-    "/"
+    typeof value ===
+    "string"
   ) {
 
-    parsed.pathname =
-      parsed.pathname.replace(
-        /\/$/,
-        ""
-      );
-
-  }
-
-
-  return parsed.href;
-
-}
-
-
-/* ============================================================
-   SAME HOSTNAME
-   ============================================================ */
-
-function sameHostname(
-  first,
-  second
-) {
-
-  return (
-    first.hostname.toLowerCase() ===
-    second.hostname.toLowerCase()
-  );
-
-}
-
-
-/* ============================================================
-   IGNORE FILE TYPES
-   ============================================================ */
-
-function isLikelyFile(
-  pathname
-) {
-
-  return /\.(pdf|jpg|jpeg|png|gif|webp|svg|ico|css|js|json|xml|zip|rar|mp4|mp3|wav|avi|mov|doc|docx|xls|xlsx|ppt|pptx)$/i
-    .test(
-      pathname
-    );
-
-}
-
-
-/* ============================================================
-   SSRF PROTECTION
-   ============================================================ */
-
-function isBlockedHostname(
-  hostname
-) {
-
-  const host =
-    hostname
-      .toLowerCase()
-      .trim();
-
-
-  const blocked = [
-
-    "localhost",
-
-    "127.0.0.1",
-
-    "0.0.0.0",
-
-    "::1",
-
-    "metadata.google.internal",
-
-    "metadata.google",
-
-    "169.254.169.254"
-
-  ];
-
-
-  if (
-    blocked.includes(
-      host
-    )
-  ) {
-
-    return true;
-
-  }
-
-
-  /* ==========================================================
-     PRIVATE IPV4
-     ========================================================== */
-
-  if (
-
-    /^10\./.test(
-      host
-    ) ||
-
-    /^192\.168\./.test(
-      host
-    ) ||
-
-    /^172\.(1[6-9]|2\d|3[0-1])\./.test(
-      host
-    ) ||
-
-    /^169\.254\./.test(
-      host
-    )
-
-  ) {
-
-    return true;
-
-  }
-
-
-  /* ==========================================================
-     PRIVATE IPV6
-     ========================================================== */
-
-  if (
-
-    host ===
-      "::1" ||
-
-    host.startsWith(
-      "fc"
-    ) ||
-
-    host.startsWith(
-      "fd"
-    ) ||
-
-    host.startsWith(
-      "fe80"
-    )
-
-  ) {
-
-    return true;
-
-  }
-
-
-  return false;
-
-}
-
-
-/* ============================================================
-   FETCH WITH TIMEOUT
-   ============================================================ */
-
-async function fetchWithTimeout(
-  url,
-  options,
-  timeout
-) {
-
-  const controller =
-    new AbortController();
-
-
-  const timer =
-    setTimeout(
-      () => {
-        controller.abort();
-      },
-      timeout
-    );
-
-
-  try {
-
-    return await fetch(
-      url,
-      {
-        ...options,
-        signal:
-          controller.signal
-      }
-    );
-
-  } finally {
-
-    clearTimeout(
-      timer
+    return cleanText(
+      value
     );
 
   }
 
+
+  return value;
+
 }
 
 
-/* ============================================================
-   DECODE HTML ENTITIES
-   ============================================================ */
+function extractFirst(
+  text,
+  regex
+) {
+
+  const match =
+    text.match(
+      regex
+    );
+
+
+  return match
+    ? match[1]
+    : null;
+
+}
+
 
 function decodeHtmlEntities(
   text
 ) {
 
-  return text
+  return String(
+    text || ""
+  )
 
-    .replace(
-      /&nbsp;/gi,
-      " "
-    )
+  .replace(
+    /&nbsp;/gi,
+    " "
+  )
 
-    .replace(
-      /&amp;/gi,
-      "&"
-    )
+  .replace(
+    /&amp;/gi,
+    "&"
+  )
 
-    .replace(
-      /&quot;/gi,
-      '"'
-    )
+  .replace(
+    /&quot;/gi,
+    '"'
+  )
 
-    .replace(
-      /&#39;/gi,
-      "'"
-    )
+  .replace(
+    /&#39;/gi,
+    "'"
+  )
 
-    .replace(
-      /&lt;/gi,
-      "<"
-    )
+  .replace(
+    /&apos;/gi,
+    "'"
+  )
 
-    .replace(
-      /&gt;/gi,
-      ">"
-    );
+  .replace(
+    /&lt;/gi,
+    "<"
+  )
 
-}
+  .replace(
+    /&gt;/gi,
+    ">"
+  )
 
-
-/* ============================================================
-   SUBREQUEST TRACKING
-   ============================================================ */
-
-function trackSubrequest() {
-
-  subrequestCount++;
-
-}
-
-
-function nearSubrequestLimit() {
-
-  return (
-    subrequestCount >=
-    SUBREQUEST_SAFETY_LIMIT
+  .replace(
+    /&#(\d+);/g,
+    (_, number) =>
+      String.fromCharCode(
+        Number(
+          number
+        )
+      )
   );
 
 }
 
 
-/* ============================================================
-   JSON RESPONSE
-   ============================================================ */
+function decodeXml(
+  text
+) {
+
+  return decodeHtmlEntities(
+    text
+  );
+
+}
+
+
+function escapeRegex(
+  text
+) {
+
+  return String(
+    text
+  ).replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&"
+  );
+
+}
+
+
+function unique(
+  array
+) {
+
+  return [
+    ...new Set(
+      array
+    )
+  ];
+
+}
+
+
+// ============================================================
+// JSON RESPONSE
+// ============================================================
 
 function jsonResponse(
   data,
@@ -2769,52 +3312,21 @@ function jsonResponse(
 ) {
 
   return new Response(
-
     JSON.stringify(
       data,
       null,
       2
     ),
-
     {
-
-      status:
-
-        status,
+      status,
 
       headers: {
+        ...CORS_HEADERS,
 
         "Content-Type":
-          "application/json",
-
-        ...corsHeaders()
-
+          "application/json"
       }
-
     }
-
   );
 
-}
-
-
-/* ============================================================
-   CORS HEADERS
-   ============================================================ */
-
-function corsHeaders() {
-
-  return {
-
-    "Access-Control-Allow-Origin":
-      "*",
-
-    "Access-Control-Allow-Methods":
-      "POST, OPTIONS",
-
-    "Access-Control-Allow-Headers":
-      "Content-Type, Authorization"
-
-  };
-
-             }
+  }
