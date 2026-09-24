@@ -98,6 +98,80 @@ function nearSubrequestLimit() {
 
 
 /* ============================================================
+   DEBUG LOGGING -> business_data
+   ============================================================
+   Cloudflare Worker console logs aren't easy to reach from
+   outside the dashboard, so every significant step and every
+   error gets written straight into business_data as its own
+   row. This lets you see exactly what happened by querying
+   Supabase directly:
+
+     select * from business_data
+     where application_id = 'YOUR_APP_ID'
+       and field like '_log_%'
+     order by field asc;
+
+   Each log row gets a unique field name (_log_<timestamp>_<rand>)
+   so it never collides with real extracted fields and never
+   gets overwritten. Logging is best-effort: failures here are
+   only console.error'd and never interrupt the actual scrape.
+   ============================================================ */
+
+function makeLogFieldName() {
+  return `_log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function logEvent(env, applicationId, level, step, message, extra) {
+  try {
+    if (!env || !env.SUPABASE_URL || !env.SUPABASE_SECRET_KEY) {
+      console.log(`[${level}] [${step}] ${message}`, extra || "");
+      return;
+    }
+
+    const payload = {
+      application_id: applicationId || "UNKNOWN_APPLICATION_ID",
+      field: makeLogFieldName(),
+      data: {
+        log: true,
+        level: level,          // "info" | "warn" | "error"
+        step: step,
+        message: message,
+        extra: extra ?? null,
+        logged_at: new Date().toISOString()
+      },
+      source_url: (extra && extra.url) || null,
+      updated_at: new Date().toISOString()
+    };
+
+    trackSubrequest();
+
+    // Plain insert (no on_conflict/merge) so log rows always land,
+    // even if the applications/business_data schema isn't fully
+    // set up yet. This is a fire-and-forget call: we don't await
+    // failures blocking the caller beyond this try/catch.
+    const response = await fetch(`${env.SUPABASE_URL}/rest/v1/business_data`, {
+      method: "POST",
+      headers: {
+        "apikey": env.SUPABASE_SECRET_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SECRET_KEY}`,
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      console.error("logEvent: failed to write log row:", response.status, text);
+    }
+
+  } catch (error) {
+    console.error("logEvent: exception while writing log row:", error?.message || String(error));
+  }
+}
+
+
+/* ============================================================
    MAIN WORKER
    ============================================================ */
 
@@ -153,9 +227,15 @@ export default {
       console.log("STEP 3: application_id =", applicationId);
       console.log("STEP 3: website_url =", websiteUrl);
 
+      await logEvent(env, applicationId, "info", "request_received", "Request body parsed.", {
+        application_id: applicationId,
+        website_url: websiteUrl
+      });
+
       /* ================= VALIDATE APPLICATION ID ================= */
 
       if (!applicationId || typeof applicationId !== "string" || !applicationId.trim()) {
+        await logEvent(env, applicationId, "error", "validate_input", "application_id is missing.", { received_body: body });
         return jsonResponse(
           { success: false, step: "validate_input", error: "application_id is missing.", received_body: body },
           400
@@ -165,6 +245,7 @@ export default {
       /* ================= VALIDATE WEBSITE URL ================= */
 
       if (!websiteUrl || typeof websiteUrl !== "string" || !websiteUrl.trim()) {
+        await logEvent(env, applicationId, "error", "validate_input", "website_url is missing.", { received_body: body });
         return jsonResponse(
           { success: false, step: "validate_input", error: "website_url is missing.", received_body: body },
           400
@@ -177,6 +258,7 @@ export default {
       try {
         startUrl = new URL(websiteUrl.trim());
       } catch (error) {
+        await logEvent(env, applicationId, "error", "validate_url", "Invalid website URL.", { website_url: websiteUrl });
         return jsonResponse(
           { success: false, step: "validate_url", error: "Invalid website URL.", website_url: websiteUrl },
           400
@@ -186,6 +268,7 @@ export default {
       /* ================= ONLY HTTP / HTTPS ================= */
 
       if (startUrl.protocol !== "https:" && startUrl.protocol !== "http:") {
+        await logEvent(env, applicationId, "error", "validate_url", "Protocol not allowed.", { protocol: startUrl.protocol });
         return jsonResponse(
           { success: false, step: "validate_url", error: "Only HTTP and HTTPS websites are supported." },
           400
@@ -195,6 +278,7 @@ export default {
       /* ================= BASIC SSRF PROTECTION ================= */
 
       if (isBlockedHostname(startUrl.hostname)) {
+        await logEvent(env, applicationId, "error", "validate_url", "Hostname is blocked.", { hostname: startUrl.hostname });
         return jsonResponse(
           { success: false, step: "validate_url", error: "This hostname is not allowed." },
           400
@@ -202,22 +286,28 @@ export default {
       }
 
       console.log("STEP 4: URL validated:", startUrl.href);
+      await logEvent(env, applicationId, "info", "validate_url", "URL validated.", { url: startUrl.href });
 
       /* ================= CHECK REQUIRED ENV VARS ================= */
 
       console.log("STEP 5: Checking Worker secrets...");
 
       if (!env.SUPABASE_URL) {
+        // Can't log to Supabase without SUPABASE_URL - console only.
+        console.error("SUPABASE_URL is missing.");
         return jsonResponse({ success: false, step: "environment", error: "SUPABASE_URL is missing." }, 500);
       }
       if (!env.SUPABASE_SECRET_KEY) {
+        console.error("SUPABASE_SECRET_KEY is missing.");
         return jsonResponse({ success: false, step: "environment", error: "SUPABASE_SECRET_KEY is missing." }, 500);
       }
       if (!env.SARVAM_API_KEY) {
+        await logEvent(env, applicationId, "error", "environment", "SARVAM_API_KEY is missing.");
         return jsonResponse({ success: false, step: "environment", error: "SARVAM_API_KEY is missing." }, 500);
       }
 
       console.log("STEP 5: All required secrets exist");
+      await logEvent(env, applicationId, "info", "environment", "All required secrets present.");
 
       /* ================= VERIFY APPLICATION EXISTS ================= */
 
@@ -226,6 +316,7 @@ export default {
       const applicationCheck = await getApplication(env, applicationId);
 
       if (!applicationCheck.success) {
+        await logEvent(env, applicationId, "error", "check_application", "Application check failed.", applicationCheck);
         return jsonResponse(
           { success: false, step: "check_application", ...applicationCheck },
           applicationCheck.status || 500
@@ -233,6 +324,7 @@ export default {
       }
 
       console.log("STEP 6: Application exists");
+      await logEvent(env, applicationId, "info", "check_application", "Application exists in Supabase.");
 
       /* ================= DISCOVER WEBSITE PAGES ================= */
 
@@ -240,12 +332,14 @@ export default {
 
       // pageMap: normalizedUrl -> html (already downloaded, reused below
       // so we don't fetch every page twice)
-      const pageMap = await discoverPages(startUrl);
+      const pageMap = await discoverPages(startUrl, env, applicationId);
       const pages = Array.from(pageMap.keys());
 
       console.log("STEP 7: Pages discovered:", pages.length);
+      await logEvent(env, applicationId, "info", "discover_pages", `Discovered ${pages.length} page(s).`, { pages });
 
       if (!pages.length) {
+        await logEvent(env, applicationId, "error", "discover_pages", "No crawlable pages found.");
         return jsonResponse(
           { success: false, step: "discover_pages", error: "Could not find any crawlable pages." },
           422
@@ -264,6 +358,10 @@ export default {
 
         if (nearSubrequestLimit()) {
           console.log("Stopping early: near Cloudflare subrequest limit.");
+          await logEvent(env, applicationId, "warn", "subrequest_limit", "Stopping early: near Cloudflare subrequest limit.", {
+            pages_completed: index,
+            pages_total: pages.length
+          });
           stoppedEarlyDueToLimit = true;
           break;
         }
@@ -273,6 +371,8 @@ export default {
         console.log("------------------------------------------");
         console.log(`PAGE ${index + 1}/${pages.length}`);
         console.log("URL:", pageUrl);
+
+        await logEvent(env, applicationId, "info", "page_start", `Starting page ${index + 1}/${pages.length}.`, { url: pageUrl });
 
         try {
 
@@ -284,6 +384,7 @@ export default {
             const pageResult = await fetchPage(pageUrl);
             if (!pageResult.success) {
               failedPages++;
+              await logEvent(env, applicationId, "error", "fetch_page", "Failed to fetch page.", { url: pageUrl, error: pageResult.error });
               results.push({ url: pageUrl, success: false, step: "fetch_page", error: pageResult.error });
               continue;
             }
@@ -299,6 +400,7 @@ export default {
 
           if (!pageText) {
             failedPages++;
+            await logEvent(env, applicationId, "error", "extract_text", "No readable text found.", { url: pageUrl });
             results.push({ url: pageUrl, success: false, step: "extract_text", error: "No readable text found." });
             continue;
           }
@@ -310,16 +412,25 @@ export default {
           /* ============ SEND TO SARVAM ============ */
 
           console.log("Sending page to Sarvam...");
+          await logEvent(env, applicationId, "info", "sarvam_request", "Sending page text to Sarvam.", {
+            url: pageUrl,
+            text_length: limitedText.length
+          });
 
           const aiResult = await extractBusinessDataWithSarvam(env, pageUrl, limitedText);
 
           if (!aiResult.success) {
             failedPages++;
+            await logEvent(env, applicationId, "error", "sarvam", "Sarvam call failed.", { url: pageUrl, error: aiResult.error });
             results.push({ url: pageUrl, success: false, step: "sarvam", error: aiResult.error });
             continue;
           }
 
           console.log("Sarvam fields received:", aiResult.fields.length);
+          await logEvent(env, applicationId, "info", "sarvam_response", `Sarvam returned ${aiResult.fields.length} field(s).`, {
+            url: pageUrl,
+            fields: aiResult.fields
+          });
 
           /* ============ SAVE FIELDS TO SUPABASE ============ */
 
@@ -332,6 +443,10 @@ export default {
 
             if (!fieldName) {
               console.log("Skipping empty field");
+              await logEvent(env, applicationId, "warn", "save_field", "Skipped field with empty/invalid name.", {
+                url: pageUrl,
+                raw_field: extractedField.field
+              });
               continue;
             }
 
@@ -339,6 +454,10 @@ export default {
 
             if (data === undefined || data === null) {
               console.log("Skipping empty data for:", fieldName);
+              await logEvent(env, applicationId, "warn", "save_field", "Skipped field with null/undefined data.", {
+                url: pageUrl,
+                field: fieldName
+              });
               continue;
             }
 
@@ -354,11 +473,20 @@ export default {
               console.error("Supabase save failed:", fieldName, saveResult.error);
               // FIX: surface this instead of silently dropping it
               fieldErrors.push({ field: fieldName, error: saveResult.error });
+              await logEvent(env, applicationId, "error", "save_field", "Supabase save failed for field.", {
+                url: pageUrl,
+                field: fieldName,
+                error: saveResult.error
+              });
               continue;
             }
 
             pageFieldsSaved++;
             totalFieldsSaved++;
+            await logEvent(env, applicationId, "info", "save_field", "Field saved successfully.", {
+              url: pageUrl,
+              field: fieldName
+            });
           }
 
           /* ============ PAGE RESULT ============ */
@@ -384,10 +512,21 @@ export default {
           });
 
           console.log(`PAGE ${index + 1} COMPLETE`);
+          await logEvent(env, applicationId, pageIsSuccess ? "info" : "warn", "page_complete", `Page ${index + 1} complete.`, {
+            url: pageUrl,
+            fields_found: aiResult.fields.length,
+            fields_saved: pageFieldsSaved,
+            field_errors: fieldErrors.length ? fieldErrors : undefined
+          });
 
         } catch (pageError) {
           failedPages++;
           console.error("PAGE ERROR:", pageError);
+          await logEvent(env, applicationId, "error", "page_processing", "Uncaught exception while processing page.", {
+            url: pageUrl,
+            error: pageError?.message || String(pageError),
+            stack: pageError?.stack || null
+          });
           results.push({
             url: pageUrl,
             success: false,
@@ -405,6 +544,14 @@ export default {
       console.log("Failed pages:", failedPages);
       console.log("Total fields saved:", totalFieldsSaved);
       console.log("==========================================");
+
+      await logEvent(env, applicationId, "info", "scrape_finished", "Scraper finished.", {
+        pages_discovered: pages.length,
+        pages_successful: successfulPages,
+        pages_failed: failedPages,
+        fields_saved: totalFieldsSaved,
+        stopped_early_due_to_subrequest_limit: stoppedEarlyDueToLimit
+      });
 
       return jsonResponse(
         {
@@ -430,6 +577,16 @@ export default {
 
     } catch (error) {
       console.error("GLOBAL WORKER ERROR:", error);
+      try {
+        const bodyForLog = await request.clone().json().catch(() => ({}));
+        const idForLog = bodyForLog.application_id || bodyForLog.applicationId || "UNKNOWN_APPLICATION_ID";
+        await logEvent(env, idForLog, "error", "global_error", "Uncaught global worker error.", {
+          error: error?.message || String(error),
+          stack: error?.stack || null
+        });
+      } catch {
+        // best effort only
+      }
       return jsonResponse(
         { success: false, step: "global_error", error: error?.message || String(error), stack: error?.stack || null },
         500
@@ -495,7 +652,7 @@ async function getApplication(env, applicationId) {
    doesn't need to re-fetch pages it already downloaded here.
    ============================================================ */
 
-async function discoverPages(startUrl) {
+async function discoverPages(startUrl, env, applicationId) {
 
   const pageMap = new Map(); // url -> html
   const queue = [];
@@ -509,6 +666,9 @@ async function discoverPages(startUrl) {
 
     if (nearSubrequestLimit()) {
       console.log("Stopping discovery early: near subrequest limit.");
+      await logEvent(env, applicationId, "warn", "discover_pages", "Stopping discovery early: near subrequest limit.", {
+        pages_found_so_far: pageMap.size
+      });
       break;
     }
 
@@ -532,12 +692,14 @@ async function discoverPages(startUrl) {
 
       if (!response.ok) {
         console.log("Skipping page:", currentUrl, "HTTP", response.status);
+        await logEvent(env, applicationId, "warn", "discover_pages", `Skipping page: HTTP ${response.status}.`, { url: currentUrl });
         continue;
       }
 
       const contentType = response.headers.get("content-type") || "";
 
       if (!contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
+        await logEvent(env, applicationId, "info", "discover_pages", "Skipping non-HTML page.", { url: currentUrl, content_type: contentType });
         continue;
       }
 
@@ -563,6 +725,10 @@ async function discoverPages(startUrl) {
 
     } catch (error) {
       console.log("Discovery error:", currentUrl, error?.message || String(error));
+      await logEvent(env, applicationId, "error", "discover_pages", "Exception while discovering page.", {
+        url: currentUrl,
+        error: error?.message || String(error)
+      });
     }
   }
 
