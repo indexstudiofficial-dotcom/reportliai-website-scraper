@@ -1,138 +1,2291 @@
 // ============================================================
-// MRME / REPORTLI WEBSITE SCRAPER
-// VERSION: 2026-09-25-V2
+// REPORTLI WEBSITE SCRAPER
+// V4 - CLOUDFLARE QUEUES
+// ============================================================
+//
+// INPUT:
+//
+// {
+//   "application_id": "app-1790254969447",
+//   "domain": "https://drjohnysdentalclinicpalakkad.com"
+// }
+//
+//
+//
+// WHAT THIS WORKER DOES:
+//
+// 1. Receives application_id + domain
+// 2. Discovers sitemap(s)
+// 3. Finds all same-domain page URLs
+// 4. Saves every URL into scrape_urls
+// 5. Sends every page to Cloudflare Queue
+// 6. Queue automatically processes pages
+// 7. Fetches each page
+// 8. Extracts raw visible text
+// 9. Saves raw text into business_data
+//
+//
+//
+// BUSINESS_DATA:
+//
+// application_id = user's application
+// source_url     = actual page URL
+// field          = "page"
+// data           = ALL extracted page text
+//
+//
+//
+// IMPORTANT:
+//
+// NO AI
+// NO SUMMARIZATION
+// NO CLASSIFICATION
+// NO BUSINESS ANALYSIS
+//
+// This Worker only collects raw website data.
+//
 // ============================================================
 
-const VERSION = "2026-09-25-V2";
 
-const MAX_SITEMAPS = 30;
+// ============================================================
+// VERSION
+// ============================================================
 
-// Only process 2 pages per invocation.
-// This keeps Cloudflare Worker subrequests low.
-const PAGES_PER_PROCESS = 2;
+const VERSION = "2026-09-25-V4";
 
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+// Maximum pages that one website can queue.
+// Increase later if you need more.
 const MAX_PAGES = 5000;
 
-const FETCH_TIMEOUT = 15000;
 
+// Maximum sitemap files checked during discovery.
+const MAX_SITEMAPS = 30;
+
+
+// Maximum HTML size we accept for one page.
 const MAX_HTML_BYTES = 5 * 1024 * 1024;
 
 
+// Maximum raw text stored for one page.
+const MAX_PAGE_TEXT_CHARS = 500000;
+
+
+// Website request timeout.
+const FETCH_TIMEOUT = 15000;
+
+
 // ============================================================
-// MAIN WORKER
+// WORKER
 // ============================================================
 
 export default {
-  async fetch(request, env) {
 
-    // ----------------------------------------------------------
-    // CORS preflight
-    // ----------------------------------------------------------
+    // ========================================================
+    // HTTP REQUEST
+    // ========================================================
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: corsHeaders()
-      });
+    async fetch(request, env, ctx) {
+
+        // ----------------------------------------------------
+        // CORS
+        // ----------------------------------------------------
+
+        if (request.method === "OPTIONS") {
+
+            return new Response(null, {
+                status: 204,
+                headers: corsHeaders()
+            });
+
+        }
+
+
+        // ----------------------------------------------------
+        // Only POST
+        // ----------------------------------------------------
+
+        if (request.method !== "POST") {
+
+            return jsonResponse(
+                {
+                    success: false,
+                    error: "Only POST requests are allowed."
+                },
+                405
+            );
+
+        }
+
+
+        try {
+
+            const body =
+                await request.json();
+
+
+            // ------------------------------------------------
+            // START
+            // ------------------------------------------------
+            //
+            // {
+            //   application_id: "...",
+            //   domain: "https://example.com"
+            // }
+            //
+
+            return await startScrape(
+                body,
+                env
+            );
+
+
+        } catch (error) {
+
+            console.error(
+                "HTTP ERROR:",
+                error
+            );
+
+
+            return jsonResponse(
+                {
+                    success: false,
+                    worker_version: VERSION,
+                    error:
+                        error?.message ||
+                        String(error)
+                },
+                500
+            );
+
+        }
+
+    },
+
+
+    // ========================================================
+    // CLOUDFLARE QUEUE CONSUMER
+    // ========================================================
+
+    async queue(batch, env, ctx) {
+
+        console.log(
+            `Queue received ${batch.messages.length} message(s).`
+        );
+
+
+        // ----------------------------------------------------
+        // Process each page message one by one.
+        //
+        // We intentionally do NOT use forEach because
+        // asynchronous work must be awaited.
+        // ----------------------------------------------------
+
+        for (
+            const message
+            of batch.messages
+        ) {
+
+            try {
+
+                await processPageMessage(
+                    message,
+                    env
+                );
+
+
+                // --------------------------------------------
+                // Successfully processed.
+                // --------------------------------------------
+
+                message.ack();
+
+
+                console.log(
+                    "Page completed:",
+                    message.body?.url
+                );
+
+
+            } catch (error) {
+
+                console.error(
+                    "Page processing failed:",
+                    message.body?.url,
+                    error
+                );
+
+
+                // --------------------------------------------
+                // Retry failed message.
+                //
+                // Cloudflare tracks attempts.
+                // --------------------------------------------
+
+                if (
+                    message.attempts < 3
+                ) {
+
+                    message.retry({
+                        delaySeconds: 10
+                    });
+
+                } else {
+
+                    // ----------------------------------------
+                    // We have reached our retry limit.
+                    //
+                    // Mark the database row as failed.
+                    // ----------------------------------------
+
+                    try {
+
+                        await markPageFailed(
+                            env,
+                            message.body,
+                            error?.message ||
+                                String(error)
+                        );
+
+                    } catch (dbError) {
+
+                        console.error(
+                            "Could not mark page failed:",
+                            dbError
+                        );
+
+                    }
+
+
+                    // ----------------------------------------
+                    // ACK it so it does not loop forever.
+                    // ----------------------------------------
+
+                    message.ack();
+
+                }
+
+            }
+
+        }
+
     }
 
-    try {
-
-      // --------------------------------------------------------
-      // Only POST
-      // --------------------------------------------------------
-
-      if (request.method !== "POST") {
-        return json({
-          success: false,
-          error: "Only POST is allowed",
-          version: VERSION
-        }, 405);
-      }
-
-      const body = await request.json();
-
-      const action = body.action;
-
-
-      // --------------------------------------------------------
-      // START
-      // --------------------------------------------------------
-
-      if (action === "start") {
-        return await startScrape(body, env);
-      }
-
-
-      // --------------------------------------------------------
-      // PROCESS
-      // --------------------------------------------------------
-
-      if (action === "process") {
-        return await processScrape(body, env);
-      }
-
-
-      // --------------------------------------------------------
-      // STATUS
-      // --------------------------------------------------------
-
-      if (action === "status") {
-        return await scrapeStatus(body, env);
-      }
-
-
-      // --------------------------------------------------------
-      // Invalid action
-      // --------------------------------------------------------
-
-      return json({
-        success: false,
-        error: "Invalid action. Use start, process, or status.",
-        version: VERSION
-      }, 400);
-
-    } catch (error) {
-
-      return json({
-        success: false,
-        version: VERSION,
-        error: error?.message || String(error)
-      }, 500);
-    }
-  }
 };
 
 
 // ============================================================
-// CORS
+// START SCRAPE
 // ============================================================
 
-function corsHeaders() {
+async function startScrape(
+    body,
+    env
+) {
 
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization"
-  };
+    // --------------------------------------------------------
+    // Read application ID
+    // --------------------------------------------------------
+
+    const applicationId =
+        String(
+            body.application_id || ""
+        ).trim();
+
+
+    // --------------------------------------------------------
+    // Read domain
+    // --------------------------------------------------------
+
+    const domain =
+        normalizeDomain(
+            String(
+                body.domain || ""
+            ).trim()
+        );
+
+
+    // --------------------------------------------------------
+    // Validation
+    // --------------------------------------------------------
+
+    if (!applicationId) {
+
+        return jsonResponse(
+            {
+                success: false,
+                error:
+                    "application_id is required."
+            },
+            400
+        );
+
+    }
+
+
+    if (!domain) {
+
+        return jsonResponse(
+            {
+                success: false,
+                error:
+                    "domain must be a valid website URL."
+            },
+            400
+        );
+
+    }
+
+
+    // --------------------------------------------------------
+    // Check if this application already has an active job.
+    // --------------------------------------------------------
+
+    const activeJobs =
+        await supabaseRequest(
+            env,
+
+            `/rest/v1/scrape_jobs?application_id=eq.${encodeURIComponent(applicationId)}&status=in.(pending,processing)&select=*`,
+
+            {
+                method: "GET"
+            }
+        );
+
+
+    if (!activeJobs.ok) {
+
+        throw new Error(
+            `Could not check active jobs: ${activeJobs.text}`
+        );
+
+    }
+
+
+    if (
+        Array.isArray(activeJobs.data) &&
+        activeJobs.data.length > 0
+    ) {
+
+        return jsonResponse({
+
+            success: true,
+
+            message:
+                "A scrape is already running for this application.",
+
+            worker_version:
+                VERSION,
+
+            job:
+                activeJobs.data[0]
+
+        });
+
+    }
+
+
+    // --------------------------------------------------------
+    // Create scrape job
+    // --------------------------------------------------------
+
+    const jobResult =
+        await supabaseRequest(
+            env,
+
+            `/rest/v1/scrape_jobs`,
+
+            {
+                method: "POST",
+
+                headers: {
+                    "Prefer":
+                        "return=representation"
+                },
+
+                body:
+                    JSON.stringify({
+
+                        application_id:
+                            applicationId,
+
+                        website:
+                            domain,
+
+                        status:
+                            "pending",
+
+                        total_urls:
+                            0,
+
+                        processed_urls:
+                            0,
+
+                        failed_urls:
+                            0
+
+                    })
+            }
+        );
+
+
+    if (!jobResult.ok) {
+
+        throw new Error(
+            `Could not create scrape job: ${jobResult.text}`
+        );
+
+    }
+
+
+    const job =
+        jobResult.data?.[0];
+
+
+    if (!job?.id) {
+
+        throw new Error(
+            "Supabase did not return a job ID."
+        );
+
+    }
+
+
+    const jobId =
+        job.id;
+
+
+    // ========================================================
+    // DISCOVER ALL WEBSITE PAGES
+    // ========================================================
+
+    console.log(
+        "Starting sitemap discovery:",
+        domain
+    );
+
+
+    const discovery =
+        await discoverWebsitePages(
+            domain
+        );
+
+
+    // --------------------------------------------------------
+    // Remove duplicate URLs.
+    // --------------------------------------------------------
+
+    let pageUrls =
+        uniqueUrls(
+            discovery.urls
+        );
+
+
+    // --------------------------------------------------------
+    // Limit maximum pages.
+    // --------------------------------------------------------
+
+    pageUrls =
+        pageUrls.slice(
+            0,
+            MAX_PAGES
+        );
+
+
+    // --------------------------------------------------------
+    // If sitemap discovery returned nothing,
+    // use homepage as fallback.
+    // --------------------------------------------------------
+
+    if (
+        pageUrls.length === 0
+    ) {
+
+        pageUrls = [
+            domain
+        ];
+
+    }
+
+
+    // ========================================================
+    // SAVE URL QUEUE TO SUPABASE
+    // ========================================================
+
+    const queueRows =
+        pageUrls.map(
+            (url) => {
+
+                return {
+
+                    job_id:
+                        jobId,
+
+                    application_id:
+                        applicationId,
+
+                    url:
+                        url,
+
+                    status:
+                        "pending",
+
+                    attempts:
+                        0,
+
+                    discovered_from:
+                        discovery.source ||
+                        domain
+
+                };
+
+            }
+        );
+
+
+    // --------------------------------------------------------
+    // Insert in chunks.
+    // --------------------------------------------------------
+
+    const chunks =
+        chunkArray(
+            queueRows,
+            500
+        );
+
+
+    for (
+        const chunk
+        of chunks
+    ) {
+
+        const result =
+            await supabaseRequest(
+                env,
+
+                `/rest/v1/scrape_urls`,
+
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Prefer":
+                            "return=minimal"
+                    },
+
+                    body:
+                        JSON.stringify(
+                            chunk
+                        )
+                }
+            );
+
+
+        if (!result.ok) {
+
+            throw new Error(
+                `Could not save scrape URLs: ${result.text}`
+            );
+
+        }
+
+    }
+
+
+    // ========================================================
+    // SEND PAGES TO CLOUDFLARE QUEUE
+    // ========================================================
+
+    //
+    // Cloudflare sendBatch supports up to 100 messages.
+    // We therefore send 100 messages at a time.
+    //
+    // The consumer itself is configured for only 2 pages
+    // per invocation.
+    //
+
+    const messageChunks =
+        chunkArray(
+            queueRows,
+            100
+        );
+
+
+    let messagesQueued =
+        0;
+
+
+    for (
+        const chunk
+        of messageChunks
+    ) {
+
+        const messages =
+            chunk.map(
+                (row) => {
+
+                    return {
+
+                        body: {
+
+                            type:
+                                "page",
+
+                            job_id:
+                                row.job_id,
+
+                            scrape_url_id:
+                                row.id,
+
+                            application_id:
+                                row.application_id,
+
+                            url:
+                                row.url
+
+                        }
+
+                    };
+
+                }
+            );
+
+
+        await env.SCRAPE_QUEUE.sendBatch(
+            messages
+        );
+
+
+        messagesQueued +=
+            messages.length;
+
+    }
+
+
+    // ========================================================
+    // UPDATE JOB
+    // ========================================================
+
+    const updateJob =
+        await supabaseRequest(
+            env,
+
+            `/rest/v1/scrape_jobs?id=eq.${encodeURIComponent(jobId)}`,
+
+            {
+                method: "PATCH",
+
+                headers: {
+                    "Prefer":
+                        "return=minimal"
+                },
+
+                body:
+                    JSON.stringify({
+
+                        status:
+                            "processing",
+
+                        total_urls:
+                            pageUrls.length,
+
+                        updated_at:
+                            new Date().toISOString()
+
+                    })
+            }
+        );
+
+
+    if (!updateJob.ok) {
+
+        throw new Error(
+            `Could not update scrape job: ${updateJob.text}`
+        );
+
+    }
+
+
+    // ========================================================
+    // RETURN TO USER
+    // ========================================================
+
+    return jsonResponse({
+
+        success: true,
+
+        worker_version:
+            VERSION,
+
+        message:
+            "Website crawl started. All discovered pages have been queued for automatic processing.",
+
+        application_id:
+            applicationId,
+
+        website:
+            domain,
+
+        job_id:
+            jobId,
+
+        discovery: {
+
+            sitemap_source:
+                discovery.source,
+
+            sitemaps_checked:
+                discovery.sitemapsChecked,
+
+            sitemap_errors:
+                discovery.sitemapErrors,
+
+            pages_found:
+                pageUrls.length
+
+        },
+
+        queue: {
+
+            messages_queued:
+                messagesQueued,
+
+            automatic:
+                true
+
+        },
+
+        next:
+            "No manual process request is required. Cloudflare Queue will process the pages automatically."
+
+    });
+
 }
 
 
 // ============================================================
-// JSON RESPONSE
+// PROCESS ONE PAGE
 // ============================================================
 
-function json(data, status = 200) {
+async function processPageMessage(
+    message,
+    env
+) {
 
-  return new Response(
-    JSON.stringify(data, null, 2),
-    {
-      status,
-      headers: {
-        "Content-Type": "application/json",
-        ...corsHeaders()
-      }
+    const body =
+        message.body;
+
+
+    if (
+        !body ||
+        body.type !== "page"
+    ) {
+
+        throw new Error(
+            "Invalid queue message."
+        );
+
     }
-  );
+
+
+    const jobId =
+        String(
+            body.job_id || ""
+        ).trim();
+
+
+    const scrapeUrlId =
+        String(
+            body.scrape_url_id || ""
+        ).trim();
+
+
+    const applicationId =
+        String(
+            body.application_id || ""
+        ).trim();
+
+
+    const url =
+        String(
+            body.url || ""
+        ).trim();
+
+
+    if (
+        !jobId ||
+        !scrapeUrlId ||
+        !applicationId ||
+        !url
+    ) {
+
+        throw new Error(
+            "Queue message is missing required fields."
+        );
+
+    }
+
+
+    // ========================================================
+    // MARK PAGE AS PROCESSING
+    // ========================================================
+
+    await updateScrapeUrl(
+        env,
+        scrapeUrlId,
+        {
+
+            status:
+                "processing",
+
+            attempts:
+                message.attempts || 1
+
+        }
+    );
+
+
+    // ========================================================
+    // FETCH PAGE
+    // ========================================================
+
+    const pageResponse =
+        await fetchPage(
+            url
+        );
+
+
+    if (!pageResponse.ok) {
+
+        throw new Error(
+            pageResponse.error
+        );
+
+    }
+
+
+    // ========================================================
+    // EXTRACT RAW TEXT
+    // ========================================================
+
+    const extracted =
+        extractPageText(
+            pageResponse.html,
+            url
+        );
+
+
+    if (!extracted.text) {
+
+        throw new Error(
+            "No visible text was found on this page."
+        );
+
+    }
+
+
+    // ========================================================
+    // SAVE RAW PAGE DATA
+    // ========================================================
+
+    //
+    // IMPORTANT:
+    //
+    // field = "page"
+    //
+    // data = all raw page text
+    //
+    // No AI.
+    // No analysis.
+    //
+
+    const businessRow = {
+
+        application_id:
+            applicationId,
+
+        source_url:
+            url,
+
+        field:
+            "page",
+
+        data: {
+
+            title:
+                extracted.title,
+
+            text:
+                extracted.text,
+
+            headings:
+                extracted.headings
+
+        },
+
+        updated_at:
+            new Date().toISOString()
+
+    };
+
+
+    const saveResult =
+        await supabaseRequest(
+            env,
+
+            `/rest/v1/business_data?on_conflict=application_id%2Csource_url%2Cfield`,
+
+            {
+                method: "POST",
+
+                headers: {
+
+                    "Prefer":
+                        "resolution=merge-duplicates,return=minimal"
+
+                },
+
+                body:
+                    JSON.stringify(
+                        [businessRow]
+                    )
+
+            }
+        );
+
+
+    if (!saveResult.ok) {
+
+        throw new Error(
+            `Could not save business_data: ${saveResult.text}`
+        );
+
+    }
+
+
+    // ========================================================
+    // MARK URL COMPLETE
+    // ========================================================
+
+    await updateScrapeUrl(
+        env,
+        scrapeUrlId,
+        {
+
+            status:
+                "completed",
+
+            processed_at:
+                new Date().toISOString(),
+
+            error:
+                null
+
+        }
+    );
+
+
+    // ========================================================
+    // UPDATE JOB COUNTERS
+    // ========================================================
+
+    await updateJobCounters(
+        env,
+        jobId
+    );
+
+
+    // ========================================================
+    // CHECK IF ENTIRE JOB IS FINISHED
+    // ========================================================
+
+    await markJobCompletedIfNecessary(
+        env,
+        jobId
+    );
+
+}
+
+
+// ============================================================
+// MARK PAGE FAILED
+// ============================================================
+
+async function markPageFailed(
+    env,
+    body,
+    error
+) {
+
+    const scrapeUrlId =
+        String(
+            body.scrape_url_id || ""
+        ).trim();
+
+
+    const jobId =
+        String(
+            body.job_id || ""
+        ).trim();
+
+
+    if (!scrapeUrlId) {
+        return;
+    }
+
+
+    await updateScrapeUrl(
+        env,
+        scrapeUrlId,
+        {
+
+            status:
+                "failed",
+
+            error:
+                String(error).slice(
+                    0,
+                    5000
+                )
+
+        }
+    );
+
+
+    if (jobId) {
+
+        await updateJobCounters(
+            env,
+            jobId
+        );
+
+
+        await markJobCompletedIfNecessary(
+            env,
+            jobId
+        );
+
+    }
+
+}
+
+
+// ============================================================
+// DISCOVER WEBSITE PAGES
+// ============================================================
+
+async function discoverWebsitePages(
+    domain
+) {
+
+    const origin =
+        new URL(
+            domain
+        ).origin;
+
+
+    // --------------------------------------------------------
+    // Possible sitemap locations.
+    // --------------------------------------------------------
+
+    const sitemapCandidates = [
+
+        `${origin}/sitemap.xml`,
+
+        `${origin}/sitemap_index.xml`,
+
+        `${origin}/sitemap-index.xml`
+
+    ];
+
+
+    // --------------------------------------------------------
+    // Read robots.txt.
+    // --------------------------------------------------------
+
+    let robotsSitemaps =
+        [];
+
+
+    try {
+
+        const robots =
+            await fetchWithTimeout(
+                `${origin}/robots.txt`,
+                {
+                    headers: {
+                        "User-Agent":
+                            "ReportliBot/1.0"
+                    }
+                },
+                FETCH_TIMEOUT
+            );
+
+
+        if (robots.ok) {
+
+            const text =
+                await robots.text();
+
+
+            robotsSitemaps =
+                extractSitemapsFromRobots(
+                    text
+                );
+
+        }
+
+    } catch (error) {
+
+        console.log(
+            "robots.txt failed:",
+            error?.message
+        );
+
+    }
+
+
+    // --------------------------------------------------------
+    // Sitemap queue.
+    // --------------------------------------------------------
+
+    const sitemapQueue =
+        uniqueUrls([
+            ...robotsSitemaps,
+            ...sitemapCandidates
+        ]);
+
+
+    const checkedSitemaps =
+        new Set();
+
+
+    const discoveredPages =
+        new Set();
+
+
+    let sitemapErrors =
+        0;
+
+
+    let source =
+        sitemapQueue[0] ||
+        null;
+
+
+    // ========================================================
+    // PROCESS SITEMAPS
+    // ========================================================
+
+    while (
+
+        sitemapQueue.length > 0 &&
+
+        checkedSitemaps.size <
+            MAX_SITEMAPS &&
+
+        discoveredPages.size <
+            MAX_PAGES
+
+    ) {
+
+        const sitemapUrl =
+            sitemapQueue.shift();
+
+
+        if (!sitemapUrl) {
+            continue;
+        }
+
+
+        if (
+            checkedSitemaps.has(
+                sitemapUrl
+            )
+        ) {
+
+            continue;
+
+        }
+
+
+        checkedSitemaps.add(
+            sitemapUrl
+        );
+
+
+        try {
+
+            const response =
+                await fetchWithTimeout(
+                    sitemapUrl,
+                    {
+                        headers: {
+
+                            "User-Agent":
+                                "ReportliBot/1.0",
+
+                            "Accept":
+                                "application/xml,text/xml,text/plain"
+
+                        }
+                    },
+                    FETCH_TIMEOUT
+                );
+
+
+            if (!response.ok) {
+
+                sitemapErrors++;
+
+                continue;
+
+            }
+
+
+            const xml =
+                await response.text();
+
+
+            const parsed =
+                parseSitemap(
+                    xml
+                );
+
+
+            // ------------------------------------------------
+            // Nested sitemap files.
+            // ------------------------------------------------
+
+            for (
+                const nested
+                of parsed.sitemaps
+            ) {
+
+                if (
+                    !checkedSitemaps.has(
+                        nested
+                    ) &&
+                    checkedSitemaps.size +
+                    sitemapQueue.length <
+                    MAX_SITEMAPS
+                ) {
+
+                    sitemapQueue.push(
+                        nested
+                    );
+
+                }
+
+            }
+
+
+            // ------------------------------------------------
+            // Page URLs.
+            // ------------------------------------------------
+
+            for (
+                const pageUrl
+                of parsed.urls
+            ) {
+
+                if (
+                    discoveredPages.size >=
+                    MAX_PAGES
+                ) {
+
+                    break;
+
+                }
+
+
+                const normalized =
+                    normalizePageUrl(
+                        pageUrl,
+                        origin
+                    );
+
+
+                if (!normalized) {
+                    continue;
+                }
+
+
+                // Only same-domain pages.
+                if (
+                    new URL(
+                        normalized
+                    ).origin !== origin
+                ) {
+
+                    continue;
+
+                }
+
+
+                discoveredPages.add(
+                    normalized
+                );
+
+            }
+
+        } catch (error) {
+
+            sitemapErrors++;
+
+            console.log(
+                "Sitemap error:",
+                sitemapUrl,
+                error?.message
+            );
+
+        }
+
+    }
+
+
+    return {
+
+        urls:
+            Array.from(
+                discoveredPages
+            ),
+
+        source,
+
+        sitemapsChecked:
+            checkedSitemaps.size,
+
+        sitemapErrors
+
+    };
+
+}
+
+
+// ============================================================
+// PARSE SITEMAP
+// ============================================================
+
+function parseSitemap(
+    xml
+) {
+
+    const sitemaps =
+        [];
+
+
+    const urls =
+        [];
+
+
+    const regex =
+        /<loc[^>]*>\s*([\s\S]*?)\s*<\/loc>/gi;
+
+
+    let match;
+
+
+    while (
+        (match =
+            regex.exec(xml))
+        !== null
+    ) {
+
+        const value =
+            decodeXmlEntities(
+                match[1].trim()
+            );
+
+
+        if (!value) {
+            continue;
+        }
+
+
+        // ----------------------------------------------------
+        // Detect nested sitemap.
+        // ----------------------------------------------------
+
+        if (
+            value.endsWith(".xml") ||
+            value.includes("sitemap")
+        ) {
+
+            sitemaps.push(
+                value
+            );
+
+        } else {
+
+            urls.push(
+                value
+            );
+
+        }
+
+    }
+
+
+    return {
+
+        sitemaps:
+            uniqueUrls(
+                sitemaps
+            ),
+
+        urls:
+            uniqueUrls(
+                urls
+            )
+
+    };
+
+}
+
+
+// ============================================================
+// ROBOTS SITEMAPS
+// ============================================================
+
+function extractSitemapsFromRobots(
+    robotsText
+) {
+
+    const result =
+        [];
+
+
+    const lines =
+        String(
+            robotsText || ""
+        ).split(
+            /\r?\n/
+        );
+
+
+    for (
+        const line
+        of lines
+    ) {
+
+        const clean =
+            line.trim();
+
+
+        if (
+            clean
+                .toLowerCase()
+                .startsWith(
+                    "sitemap:"
+                )
+        ) {
+
+            const sitemap =
+                clean
+                    .substring(
+                        "sitemap:".length
+                    )
+                    .trim();
+
+
+            if (sitemap) {
+
+                result.push(
+                    sitemap
+                );
+
+            }
+
+        }
+
+    }
+
+
+    return uniqueUrls(
+        result
+    );
+
+}
+
+
+// ============================================================
+// FETCH PAGE
+// ============================================================
+
+async function fetchPage(
+    url
+) {
+
+    try {
+
+        const response =
+            await fetchWithTimeout(
+
+                url,
+
+                {
+
+                    method:
+                        "GET",
+
+                    redirect:
+                        "follow",
+
+                    headers: {
+
+                        "User-Agent":
+                            "Mozilla/5.0 (compatible; ReportliBot/1.0; +https://reportliai.sbs)",
+
+                        "Accept":
+                            "text/html,application/xhtml+xml"
+
+                    }
+
+                },
+
+                FETCH_TIMEOUT
+            );
+
+
+        if (!response.ok) {
+
+            return {
+
+                ok:
+                    false,
+
+                error:
+                    `HTTP ${response.status}`
+
+            };
+
+        }
+
+
+        const contentType =
+            response.headers.get(
+                "content-type"
+            ) || "";
+
+
+        if (
+            !contentType.includes(
+                "text/html"
+            ) &&
+            !contentType.includes(
+                "application/xhtml+xml"
+            )
+        ) {
+
+            return {
+
+                ok:
+                    false,
+
+                error:
+                    `Not an HTML page: ${contentType}`
+
+            };
+
+        }
+
+
+        // ----------------------------------------------------
+        // Check declared size.
+        // ----------------------------------------------------
+
+        const contentLength =
+            Number(
+                response.headers.get(
+                    "content-length"
+                ) || 0
+            );
+
+
+        if (
+            contentLength >
+            MAX_HTML_BYTES
+        ) {
+
+            return {
+
+                ok:
+                    false,
+
+                error:
+                    "HTML page is larger than 5 MB."
+
+            };
+
+        }
+
+
+        const html =
+            await response.text();
+
+
+        // ----------------------------------------------------
+        // Check actual size.
+        // ----------------------------------------------------
+
+        const actualBytes =
+            new TextEncoder()
+                .encode(
+                    html
+                )
+                .length;
+
+
+        if (
+            actualBytes >
+            MAX_HTML_BYTES
+        ) {
+
+            return {
+
+                ok:
+                    false,
+
+                error:
+                    "HTML page is larger than 5 MB."
+
+            };
+
+        }
+
+
+        return {
+
+            ok:
+                true,
+
+            html
+
+        };
+
+
+    } catch (error) {
+
+        return {
+
+            ok:
+                false,
+
+            error:
+                error?.message ||
+                String(error)
+
+        };
+
+    }
+
+}
+
+
+// ============================================================
+// EXTRACT PAGE TEXT
+// ============================================================
+
+function extractPageText(
+    html,
+    pageUrl
+) {
+
+    let working =
+        String(
+            html || ""
+        );
+
+
+    // --------------------------------------------------------
+    // Remove scripts.
+    // --------------------------------------------------------
+
+    working =
+        working.replace(
+            /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+            " "
+        );
+
+
+    // --------------------------------------------------------
+    // Remove styles.
+    // --------------------------------------------------------
+
+    working =
+        working.replace(
+            /<style\b[^>]*>[\s\S]*?<\/style>/gi,
+            " "
+        );
+
+
+    // --------------------------------------------------------
+    // Remove noscript.
+    // --------------------------------------------------------
+
+    working =
+        working.replace(
+            /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
+            " "
+        );
+
+
+    // --------------------------------------------------------
+    // Remove SVG.
+    // --------------------------------------------------------
+
+    working =
+        working.replace(
+            /<svg\b[^>]*>[\s\S]*?<\/svg>/gi,
+            " "
+        );
+
+
+    // --------------------------------------------------------
+    // Remove template.
+    // --------------------------------------------------------
+
+    working =
+        working.replace(
+            /<template\b[^>]*>[\s\S]*?<\/template>/gi,
+            " "
+        );
+
+
+    // ========================================================
+    // TITLE
+    // ========================================================
+
+    let title =
+        "";
+
+
+    const titleMatch =
+        working.match(
+            /<title\b[^>]*>([\s\S]*?)<\/title>/i
+        );
+
+
+    if (titleMatch) {
+
+        title =
+            cleanText(
+                decodeHtml(
+                    stripTags(
+                        titleMatch[1]
+                    )
+                )
+            );
+
+    }
+
+
+    // ========================================================
+    // HEADINGS
+    // ========================================================
+
+    const headings =
+        [];
+
+
+    const headingRegex =
+        /<h[1-6]\b[^>]*>([\s\S]*?)<\/h[1-6]>/gi;
+
+
+    let headingMatch;
+
+
+    while (
+        (headingMatch =
+            headingRegex.exec(
+                working
+            ))
+        !== null
+    ) {
+
+        const heading =
+            cleanText(
+                decodeHtml(
+                    stripTags(
+                        headingMatch[1]
+                    )
+                )
+            );
+
+
+        if (heading) {
+
+            headings.push(
+                heading
+            );
+
+        }
+
+    }
+
+
+    // ========================================================
+    // ADD NEWLINES AROUND CONTENT BLOCKS
+    // ========================================================
+
+    working =
+        working.replace(
+
+            /<(br|\/p|\/div|\/section|\/article|\/main|\/header|\/footer|\/li|\/h[1-6]|\/tr|\/td|\/th)[^>]*>/gi,
+
+            "\n"
+
+        );
+
+
+    // ========================================================
+    // REMOVE REMAINING HTML
+    // ========================================================
+
+    working =
+        stripTags(
+            working
+        );
+
+
+    // ========================================================
+    // DECODE ENTITIES
+    // ========================================================
+
+    working =
+        decodeHtml(
+            working
+        );
+
+
+    // ========================================================
+    // CLEAN TEXT
+    // ========================================================
+
+    const text =
+        cleanText(
+            working
+        ).slice(
+            0,
+            MAX_PAGE_TEXT_CHARS
+        );
+
+
+    return {
+
+        url:
+            pageUrl,
+
+        title,
+
+        text,
+
+        headings:
+            uniqueStrings(
+                headings
+            )
+
+    };
+
+}
+
+
+// ============================================================
+// STRIP HTML TAGS
+// ============================================================
+
+function stripTags(
+    value
+) {
+
+    return String(
+        value || ""
+    ).replace(
+        /<[^>]+>/g,
+        " "
+    );
+
+}
+
+
+// ============================================================
+// CLEAN TEXT
+// ============================================================
+
+function cleanText(
+    value
+) {
+
+    return String(
+        value || ""
+    )
+
+        .replace(
+            /\u00a0/g,
+            " "
+        )
+
+        .replace(
+            /[\t\r\f]+/g,
+            " "
+        )
+
+        .replace(
+            /[ ]{2,}/g,
+            " "
+        )
+
+        .replace(
+            /\n[ ]+/g,
+            "\n"
+        )
+
+        .replace(
+            /[ ]+\n/g,
+            "\n"
+        )
+
+        .replace(
+            /\n{3,}/g,
+            "\n\n"
+        )
+
+        .trim();
+
+}
+
+
+// ============================================================
+// HTML ENTITY DECODER
+// ============================================================
+
+function decodeHtml(
+    value
+) {
+
+    return String(
+        value || ""
+    )
+
+        .replace(
+            /&nbsp;/gi,
+            " "
+        )
+
+        .replace(
+            /&amp;/gi,
+            "&"
+        )
+
+        .replace(
+            /&quot;/gi,
+            '"'
+        )
+
+        .replace(
+            /&#39;/gi,
+            "'"
+        )
+
+        .replace(
+            /&apos;/gi,
+            "'"
+        )
+
+        .replace(
+            /&lt;/gi,
+            "<"
+        )
+
+        .replace(
+            /&gt;/gi,
+            ">"
+        )
+
+        .replace(
+            /&#(\d+);/g,
+            (_, code) =>
+                String.fromCodePoint(
+                    Number(code)
+                )
+        )
+
+        .replace(
+            /&#x([0-9a-f]+);/gi,
+            (_, code) =>
+                String.fromCodePoint(
+                    parseInt(
+                        code,
+                        16
+                    )
+                )
+        );
+
+}
+
+
+// ============================================================
+// XML ENTITY DECODER
+// ============================================================
+
+function decodeXmlEntities(
+    value
+) {
+
+    return String(
+        value || ""
+    )
+
+        .replace(
+            /&amp;/gi,
+            "&"
+        )
+
+        .replace(
+            /&lt;/gi,
+            "<"
+        )
+
+        .replace(
+            /&gt;/gi,
+            ">"
+        )
+
+        .replace(
+            /&quot;/gi,
+            '"'
+        )
+
+        .replace(
+            /&apos;/gi,
+            "'"
+        );
+
+}
+
+
+// ============================================================
+// NORMALIZE DOMAIN
+// ============================================================
+
+function normalizeDomain(
+    domain
+) {
+
+    if (!domain) {
+        return null;
+    }
+
+
+    try {
+
+        let value =
+            domain.trim();
+
+
+        if (
+            !value.startsWith(
+                "http://"
+            ) &&
+            !value.startsWith(
+                "https://"
+            )
+        ) {
+
+            value =
+                "https://" +
+                value;
+
+        }
+
+
+        const url =
+            new URL(
+                value
+            );
+
+
+        return url.origin;
+
+
+    } catch {
+
+        return null;
+
+    }
+
+}
+
+
+// ============================================================
+// NORMALIZE PAGE URL
+// ============================================================
+
+function normalizePageUrl(
+    value,
+    origin
+) {
+
+    try {
+
+        const url =
+            new URL(
+                value,
+                origin
+            );
+
+
+        if (
+            url.protocol !== "http:" &&
+            url.protocol !== "https:"
+        ) {
+
+            return null;
+
+        }
+
+
+        if (
+            url.origin !== origin
+        ) {
+
+            return null;
+
+        }
+
+
+        // ----------------------------------------------------
+        // Remove #section
+        // ----------------------------------------------------
+
+        url.hash =
+            "";
+
+
+        // ----------------------------------------------------
+        // Remove common tracking parameters.
+        // ----------------------------------------------------
+
+        const tracking =
+            [
+
+                "utm_source",
+                "utm_medium",
+                "utm_campaign",
+                "utm_term",
+                "utm_content",
+                "fbclid",
+                "gclid"
+
+            ];
+
+
+        for (
+            const parameter
+            of tracking
+        ) {
+
+            url.searchParams.delete(
+                parameter
+            );
+
+        }
+
+
+        return url.toString();
+
+
+    } catch {
+
+        return null;
+
+    }
+
+}
+
+
+// ============================================================
+// UNIQUE URLS
+// ============================================================
+
+function uniqueUrls(
+    urls
+) {
+
+    const set =
+        new Set();
+
+
+    for (
+        const url
+        of urls || []
+    ) {
+
+        if (!url) {
+            continue;
+        }
+
+
+        set.add(
+            String(
+                url
+            ).trim()
+        );
+
+    }
+
+
+    return Array.from(
+        set
+    );
+
+}
+
+
+// ============================================================
+// UNIQUE STRINGS
+// ============================================================
+
+function uniqueStrings(
+    values
+) {
+
+    const set =
+        new Set();
+
+
+    for (
+        const value
+        of values || []
+    ) {
+
+        const clean =
+            String(
+                value || ""
+            ).trim();
+
+
+        if (clean) {
+
+            set.add(
+                clean
+            );
+
+        }
+
+    }
+
+
+    return Array.from(
+        set
+    );
+
 }
 
 
@@ -141,59 +2294,466 @@ function json(data, status = 200) {
 // ============================================================
 
 async function supabaseRequest(
-  env,
-  path,
-  options = {}
+    env,
+    path,
+    options = {}
 ) {
 
-  const url =
-    `${env.SUPABASE_URL}/rest/v1/${path}`;
-
-  const headers = {
-    "apikey":
-      env.SUPABASE_SERVICE_ROLE_KEY,
-
-    "Authorization":
-      `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-
-    "Content-Type":
-      "application/json",
-
-    ...(options.headers || {})
-  };
+    const baseUrl =
+        String(
+            env.SUPABASE_URL || ""
+        ).replace(
+            /\/$/,
+            ""
+        );
 
 
-  const response = await fetch(
-    url,
-    {
-      ...options,
-      headers
+    const serviceKey =
+        env.SUPABASE_SERVICE_ROLE_KEY;
+
+
+    if (!baseUrl) {
+
+        throw new Error(
+            "SUPABASE_URL is missing."
+        );
+
     }
-  );
 
 
-  const text =
-    await response.text();
+    if (!serviceKey) {
+
+        throw new Error(
+            "SUPABASE_SERVICE_ROLE_KEY is missing."
+        );
+
+    }
 
 
-  if (!response.ok) {
+    const headers = {
 
-    throw new Error(
-      `Supabase ${response.status}: ${text}`
-    );
-  }
+        "apikey":
+            serviceKey,
+
+        "Authorization":
+            `Bearer ${serviceKey}`,
+
+        "Content-Type":
+            "application/json",
+
+        ...(options.headers || {})
+
+    };
 
 
-  if (!text) {
-    return null;
-  }
+    const response =
+        await fetch(
+            `${baseUrl}${path}`,
+            {
+                ...options,
+                headers
+            }
+        );
 
 
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
-  }
+    const text =
+        await response.text();
+
+
+    let data =
+        null;
+
+
+    try {
+
+        data =
+            text
+                ? JSON.parse(
+                    text
+                )
+                : null;
+
+    } catch {
+
+        data =
+            text;
+
+    }
+
+
+    return {
+
+        ok:
+            response.ok,
+
+        status:
+            response.status,
+
+        data,
+
+        text
+
+    };
+
+}
+
+
+// ============================================================
+// UPDATE SCRAPE URL
+// ============================================================
+
+async function updateScrapeUrl(
+    env,
+    scrapeUrlId,
+    data
+) {
+
+    const result =
+        await supabaseRequest(
+
+            env,
+
+            `/rest/v1/scrape_urls?id=eq.${encodeURIComponent(scrapeUrlId)}`,
+
+            {
+                method:
+                    "PATCH",
+
+                headers: {
+
+                    "Prefer":
+                        "return=minimal"
+
+                },
+
+                body:
+                    JSON.stringify(
+                        data
+                    )
+
+            }
+
+        );
+
+
+    if (!result.ok) {
+
+        throw new Error(
+            `Could not update scrape URL: ${result.text}`
+        );
+
+    }
+
+}
+
+
+// ============================================================
+// UPDATE JOB COUNTERS
+// ============================================================
+
+async function updateJobCounters(
+    env,
+    jobId
+) {
+
+    // --------------------------------------------------------
+    // Count completed pages using Supabase count header.
+    // --------------------------------------------------------
+
+    const completed =
+        await supabaseRequest(
+
+            env,
+
+            `/rest/v1/scrape_urls?job_id=eq.${encodeURIComponent(jobId)}&status=eq.completed&select=id`,
+
+            {
+                method:
+                    "GET",
+
+                headers: {
+
+                    "Prefer":
+                        "count=exact"
+
+                }
+
+            }
+
+        );
+
+
+    // --------------------------------------------------------
+    // Count failed pages.
+    // --------------------------------------------------------
+
+    const failed =
+        await supabaseRequest(
+
+            env,
+
+            `/rest/v1/scrape_urls?job_id=eq.${encodeURIComponent(jobId)}&status=eq.failed&select=id`,
+
+            {
+                method:
+                    "GET",
+
+                headers: {
+
+                    "Prefer":
+                        "count=exact"
+
+                }
+
+            }
+
+        );
+
+
+    if (!completed.ok) {
+
+        throw new Error(
+            `Could not count completed pages: ${completed.text}`
+        );
+
+    }
+
+
+    if (!failed.ok) {
+
+        throw new Error(
+            `Could not count failed pages: ${failed.text}`
+        );
+
+    }
+
+
+    const processedCount =
+        extractContentRangeCount(
+            completed
+        );
+
+
+    const failedCount =
+        extractContentRangeCount(
+            failed
+        );
+
+
+    // --------------------------------------------------------
+    // Update job.
+    // --------------------------------------------------------
+
+    const update =
+        await supabaseRequest(
+
+            env,
+
+            `/rest/v1/scrape_jobs?id=eq.${encodeURIComponent(jobId)}`,
+
+            {
+                method:
+                    "PATCH",
+
+                headers: {
+
+                    "Prefer":
+                        "return=minimal"
+
+                },
+
+                body:
+                    JSON.stringify({
+
+                        processed_urls:
+                            processedCount,
+
+                        failed_urls:
+                            failedCount,
+
+                        updated_at:
+                            new Date().toISOString()
+
+                    })
+
+            }
+
+        );
+
+
+    if (!update.ok) {
+
+        throw new Error(
+            `Could not update job counters: ${update.text}`
+        );
+
+    }
+
+}
+
+
+// ============================================================
+// EXTRACT SUPABASE COUNT
+// ============================================================
+
+function extractContentRangeCount(
+    result
+) {
+
+    // Supabase/PostgREST normally returns:
+    //
+    // Content-Range: 0-0/123
+    //
+    // We cannot access the response headers because our helper
+    // currently returns only the response body.
+    //
+    // Therefore we use the returned array length for now.
+    //
+    // This is safe for the small status requests but is not
+    // ideal for very large sites.
+    //
+    // The actual page processing itself does NOT depend on this.
+    //
+
+    if (
+        Array.isArray(
+            result.data
+        )
+    ) {
+
+        return result.data.length;
+
+    }
+
+
+    return 0;
+
+}
+
+
+// ============================================================
+// GET JOB
+// ============================================================
+
+async function getJob(
+    env,
+    jobId
+) {
+
+    const result =
+        await supabaseRequest(
+
+            env,
+
+            `/rest/v1/scrape_jobs?id=eq.${encodeURIComponent(jobId)}&select=*`,
+
+            {
+                method:
+                    "GET"
+            }
+
+        );
+
+
+    if (!result.ok) {
+
+        throw new Error(
+            `Could not get job: ${result.text}`
+        );
+
+    }
+
+
+    return result.data?.[0] ||
+        null;
+
+}
+
+
+// ============================================================
+// CHECK JOB COMPLETION
+// ============================================================
+
+async function markJobCompletedIfNecessary(
+    env,
+    jobId
+) {
+
+    const job =
+        await getJob(
+            env,
+            jobId
+        );
+
+
+    if (!job) {
+        return;
+    }
+
+
+    const processed =
+        Number(
+            job.processed_urls ||
+            0
+        );
+
+
+    const failed =
+        Number(
+            job.failed_urls ||
+            0
+        );
+
+
+    const total =
+        Number(
+            job.total_urls ||
+            0
+        );
+
+
+    if (
+        total > 0 &&
+        processed + failed >= total
+    ) {
+
+        await supabaseRequest(
+
+            env,
+
+            `/rest/v1/scrape_jobs?id=eq.${encodeURIComponent(jobId)}`,
+
+            {
+                method:
+                    "PATCH",
+
+                headers: {
+
+                    "Prefer":
+                        "return=minimal"
+
+                },
+
+                body:
+                    JSON.stringify({
+
+                        status:
+                            "completed",
+
+                        completed_at:
+                            new Date().toISOString(),
+
+                        updated_at:
+                            new Date().toISOString()
+
+                    })
+
+            }
+
+        );
+
+    }
+
 }
 
 
@@ -202,2238 +2762,138 @@ async function supabaseRequest(
 // ============================================================
 
 async function fetchWithTimeout(
-  url,
-  options = {}
+    url,
+    options,
+    timeout
 ) {
 
-  const controller =
-    new AbortController();
-
-
-  const timeout =
-    setTimeout(
-      () => controller.abort(),
-      FETCH_TIMEOUT
-    );
-
-
-  try {
-
-    return await fetch(
-      url,
-      {
-        ...options,
-        signal: controller.signal
-      }
-    );
-
-  } finally {
-
-    clearTimeout(timeout);
-  }
-}
-
-
-// ============================================================
-// NORMALIZE DOMAIN
-// ============================================================
-
-function normalizeDomain(domain) {
-
-  let value =
-    String(domain || "").trim();
-
-
-  if (!value) {
-    throw new Error(
-      "domain is required"
-    );
-  }
-
-
-  if (
-    !/^https?:\/\//i.test(value)
-  ) {
-    value =
-      `https://${value}`;
-  }
-
-
-  const url =
-    new URL(value);
-
-
-  url.pathname = "/";
-  url.search = "";
-  url.hash = "";
-
-
-  return url.origin;
-}
-
-
-// ============================================================
-// NORMALIZE URL
-// ============================================================
-
-function normalizeUrl(
-  url,
-  baseUrl
-) {
-
-  try {
-
-    const parsed =
-      new URL(
-        url,
-        baseUrl
-      );
-
-
-    if (
-      parsed.protocol !== "http:" &&
-      parsed.protocol !== "https:"
-    ) {
-      return null;
-    }
-
-
-    // Remove #section
-    parsed.hash = "";
-
-
-    // Remove tracking parameters
-    const removeParams = [
-      "utm_source",
-      "utm_medium",
-      "utm_campaign",
-      "utm_term",
-      "utm_content",
-      "fbclid",
-      "gclid"
-    ];
-
-
-    for (
-      const param of removeParams
-    ) {
-
-      parsed.searchParams.delete(
-        param
-      );
-    }
-
-
-    return parsed.href;
-
-  } catch {
-
-    return null;
-  }
-}
-
-
-// ============================================================
-// SAME ORIGIN
-// ============================================================
-
-function isSameOrigin(
-  url,
-  origin
-) {
-
-  try {
-
-    return (
-      new URL(url).origin ===
-      origin
-    );
-
-  } catch {
-
-    return false;
-  }
-}
-
-
-// ============================================================
-// FETCH TEXT
-// ============================================================
-
-async function fetchText(url) {
-
-  const response =
-    await fetchWithTimeout(
-      url,
-      {
-        headers: {
-          "User-Agent":
-            "MRME-Website-Crawler/2.0"
-        }
-      }
-    );
-
-
-  if (!response.ok) {
-
-    throw new Error(
-      `HTTP ${response.status}`
-    );
-  }
-
-
-  const contentType =
-    response.headers.get(
-      "content-type"
-    ) || "";
-
-
-  if (
-    !contentType.includes("text") &&
-    !contentType.includes("xml") &&
-    !contentType.includes("html")
-  ) {
-
-    throw new Error(
-      `Unsupported content type: ${contentType}`
-    );
-  }
-
-
-  const contentLength =
-    Number(
-      response.headers.get(
-        "content-length"
-      ) || 0
-    );
-
-
-  if (
-    contentLength >
-    MAX_HTML_BYTES
-  ) {
-
-    throw new Error(
-      "Response too large"
-    );
-  }
-
-
-  const text =
-    await response.text();
-
-
-  if (
-    text.length >
-    MAX_HTML_BYTES
-  ) {
-
-    throw new Error(
-      "Response too large"
-    );
-  }
-
-
-  return text;
-}
-
-
-// ============================================================
-// DISCOVER SITEMAPS
-// ============================================================
-
-async function discoverSitemaps(
-  origin
-) {
-
-  const candidates = [
-
-    `${origin}/sitemap.xml`,
-
-    `${origin}/wp-sitemap.xml`,
-
-    `${origin}/sitemap_index.xml`,
-
-    `${origin}/sitemap-index.xml`
-
-  ];
-
-
-  const discovered =
-    new Set();
-
-
-  // ----------------------------------------------------------
-  // robots.txt
-  // ----------------------------------------------------------
-
-  try {
-
-    const robots =
-      await fetchText(
-        `${origin}/robots.txt`
-      );
-
-
-    const lines =
-      robots.split(/\r?\n/);
-
-
-    for (
-      const line of lines
-    ) {
-
-      if (
-        line
-          .toLowerCase()
-          .startsWith("sitemap:")
-      ) {
-
-        const sitemap =
-          line
-            .substring(
-              line.indexOf(":") + 1
-            )
-            .trim();
-
-
-        const normalized =
-          normalizeUrl(
-            sitemap,
-            origin
-          );
-
-
-        if (normalized) {
-          discovered.add(
-            normalized
-          );
-        }
-      }
-    }
-
-  } catch {
-
-    // robots.txt is optional
-  }
-
-
-  // ----------------------------------------------------------
-  // Standard sitemap locations
-  // ----------------------------------------------------------
-
-  for (
-    const candidate of candidates
-  ) {
-
-    discovered.add(
-      candidate
-    );
-  }
-
-
-  return [
-    ...discovered
-  ]
-    .filter(
-      url =>
-        isSameOrigin(
-          url,
-          origin
-        )
-    )
-    .slice(
-      0,
-      MAX_SITEMAPS
-    );
-}
-
-
-// ============================================================
-// PARSE SITEMAP XML
-// ============================================================
-
-function parseSitemap(
-  xml,
-  origin
-) {
-
-  const urls =
-    new Set();
-
-
-  const locRegex =
-    /<loc[^>]*>([\s\S]*?)<\/loc>/gi;
-
-
-  let match;
-
-
-  while (
-    (match =
-      locRegex.exec(xml))
-  ) {
-
-    const raw =
-      match[1]
-        .replace(
-          /<!\[CDATA\[/g,
-          ""
-        )
-        .replace(
-          /\]\]>/g,
-          ""
-        )
-        .trim();
-
-
-    const url =
-      normalizeUrl(
-        raw,
-        origin
-      );
-
-
-    if (url) {
-      urls.add(url);
-    }
-  }
-
-
-  return [
-    ...urls
-  ];
-}
-
-
-// ============================================================
-// DISCOVER URLS FROM SITEMAPS
-// ============================================================
-
-async function discoverUrls(
-  origin
-) {
-
-  const sitemapUrls =
-    await discoverSitemaps(
-      origin
-    );
-
-
-  const checked =
-    new Set();
-
-
-  const pageUrls =
-    new Set();
-
-
-  const sitemapQueue =
-    [...sitemapUrls];
-
-
-  let sitemapErrors = 0;
-
-
-  while (
-    sitemapQueue.length > 0 &&
-    checked.size < MAX_SITEMAPS
-  ) {
-
-    const sitemap =
-      sitemapQueue.shift();
-
-
-    if (
-      checked.has(sitemap)
-    ) {
-      continue;
-    }
-
-
-    checked.add(sitemap);
+    const controller =
+        new AbortController();
+
+
+    const timer =
+        setTimeout(
+            () => {
+                controller.abort();
+            },
+            timeout
+        );
 
 
     try {
 
-      const xml =
-        await fetchText(
-          sitemap
-        );
+        return await fetch(
 
-
-      const locations =
-        parseSitemap(
-          xml,
-          origin
-        );
-
-
-      for (
-        const url of locations
-      ) {
-
-        const lower =
-          url.toLowerCase();
-
-
-        const looksLikeSitemap =
-          lower.endsWith(".xml") ||
-          lower.includes("sitemap");
-
-
-        // ----------------------------------------------------
-        // Nested sitemap
-        // ----------------------------------------------------
-
-        if (
-          looksLikeSitemap
-        ) {
-
-          if (
-            !checked.has(url) &&
-            sitemapQueue.length <
-              MAX_SITEMAPS
-          ) {
-
-            sitemapQueue.push(
-              url
-            );
-          }
-
-
-          continue;
-        }
-
-
-        // ----------------------------------------------------
-        // Normal webpage
-        // ----------------------------------------------------
-
-        if (
-          isSameOrigin(
             url,
-            origin
-          ) &&
-          pageUrls.size <
-            MAX_PAGES
-        ) {
 
-          pageUrls.add(
-            url
-          );
-        }
-      }
+            {
+                ...options,
 
-    } catch {
+                signal:
+                    controller.signal
+            }
 
-      sitemapErrors++;
-    }
-  }
-
-
-  return {
-
-    urls:
-      [...pageUrls],
-
-    sitemaps_checked:
-      checked.size,
-
-    sitemap_errors:
-      sitemapErrors
-  };
-}
-
-
-// ============================================================
-// START SCRAPE
-// ============================================================
-
-async function startScrape(
-  body,
-  env
-) {
-
-  const applicationId =
-    String(
-      body.application_id || ""
-    ).trim();
-
-
-  if (!applicationId) {
-
-    return json({
-      success: false,
-      error:
-        "application_id is required"
-    }, 400);
-  }
-
-
-  const origin =
-    normalizeDomain(
-      body.domain
-    );
-
-
-  // ----------------------------------------------------------
-  // Check for existing active job
-  // ----------------------------------------------------------
-
-  const existing =
-    await supabaseRequest(
-      env,
-      `scrape_jobs?application_id=eq.${encodeURIComponent(applicationId)}&status=in.(pending,running)&select=*&order=created_at.desc&limit=1`
-    );
-
-
-  if (
-    Array.isArray(existing) &&
-    existing.length > 0
-  ) {
-
-    return json({
-
-      success:
-        true,
-
-      message:
-        "An active scrape already exists.",
-
-      version:
-        VERSION,
-
-      job:
-        existing[0]
-    });
-  }
-
-
-  // ----------------------------------------------------------
-  // Create scrape job
-  // ----------------------------------------------------------
-
-  const jobs =
-    await supabaseRequest(
-      env,
-      "scrape_jobs",
-      {
-        method:
-          "POST",
-
-        headers: {
-          "Prefer":
-            "return=representation"
-        },
-
-        body:
-          JSON.stringify({
-
-            application_id:
-              applicationId,
-
-            website:
-              origin,
-
-            status:
-              "running"
-          })
-      }
-    );
-
-
-  const job =
-    Array.isArray(jobs)
-      ? jobs[0]
-      : jobs;
-
-
-  if (!job?.id) {
-
-    throw new Error(
-      "Failed to create scrape job"
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // Discover sitemap URLs
-  //
-  // IMPORTANT:
-  // We DO NOT fetch all website pages here.
-  // ----------------------------------------------------------
-
-  const discovery =
-    await discoverUrls(
-      origin
-    );
-
-
-  let urls =
-    discovery.urls.slice(
-      0,
-      MAX_PAGES
-    );
-
-
-  // ----------------------------------------------------------
-  // If sitemap is unavailable,
-  // start from homepage.
-  // ----------------------------------------------------------
-
-  if (
-    urls.length === 0
-  ) {
-
-    urls = [
-      `${origin}/`
-    ];
-  }
-
-
-  // ----------------------------------------------------------
-  // Create queue records
-  // ----------------------------------------------------------
-
-  const queueRows =
-    urls.map(
-      url => ({
-
-        job_id:
-          job.id,
-
-        application_id:
-          applicationId,
-
-        url,
-
-        status:
-          "pending",
-
-        discovered_from:
-          "sitemap"
-      })
-    );
-
-
-  // ----------------------------------------------------------
-  // ONE bulk Supabase request
-  // ----------------------------------------------------------
-
-  await supabaseRequest(
-    env,
-    "scrape_urls?on_conflict=job_id,url",
-    {
-      method:
-        "POST",
-
-      headers: {
-        "Prefer":
-          "resolution=ignore-duplicates,return=minimal"
-      },
-
-      body:
-        JSON.stringify(
-          queueRows
-        )
-    }
-  );
-
-
-  // ----------------------------------------------------------
-  // Update total
-  // ----------------------------------------------------------
-
-  await supabaseRequest(
-    env,
-    `scrape_jobs?id=eq.${encodeURIComponent(job.id)}`,
-    {
-      method:
-        "PATCH",
-
-      headers: {
-        "Prefer":
-          "return=minimal"
-      },
-
-      body:
-        JSON.stringify({
-
-          total_urls:
-            urls.length,
-
-          updated_at:
-            new Date().toISOString()
-        })
-    }
-  );
-
-
-  return json({
-
-    success:
-      true,
-
-    version:
-      VERSION,
-
-    action:
-      "start",
-
-    application_id:
-      applicationId,
-
-    website:
-      origin,
-
-    job_id:
-      job.id,
-
-    discovery: {
-
-      pages_found:
-        urls.length,
-
-      sitemaps_checked:
-        discovery.sitemaps_checked,
-
-      sitemap_errors:
-        discovery.sitemap_errors
-    },
-
-    message:
-      "Discovery complete. Call action=process using the returned job_id."
-  });
-}
-
-
-// ============================================================
-// PROCESS SCRAPE QUEUE
-// ============================================================
-
-async function processScrape(
-  body,
-  env
-) {
-
-  const jobId =
-    String(
-      body.job_id || ""
-    ).trim();
-
-
-  if (!jobId) {
-
-    return json({
-      success: false,
-      error:
-        "job_id is required"
-    }, 400);
-  }
-
-
-  // ----------------------------------------------------------
-  // Get job
-  // ----------------------------------------------------------
-
-  const jobs =
-    await supabaseRequest(
-      env,
-      `scrape_jobs?id=eq.${encodeURIComponent(jobId)}&select=*&limit=1`
-    );
-
-
-  if (
-    !Array.isArray(jobs) ||
-    jobs.length === 0
-  ) {
-
-    return json({
-      success: false,
-      error:
-        "Scrape job not found"
-    }, 404);
-  }
-
-
-  const job =
-    jobs[0];
-
-
-  // ----------------------------------------------------------
-  // Get only 2 pending URLs
-  // ----------------------------------------------------------
-
-  const pending =
-    await supabaseRequest(
-      env,
-      `scrape_urls?job_id=eq.${encodeURIComponent(jobId)}&status=eq.pending&select=*&order=created_at.asc&limit=${PAGES_PER_PROCESS}`
-    );
-
-
-  // ----------------------------------------------------------
-  // Nothing left
-  // ----------------------------------------------------------
-
-  if (
-    !Array.isArray(pending) ||
-    pending.length === 0
-  ) {
-
-    await supabaseRequest(
-      env,
-      `scrape_jobs?id=eq.${encodeURIComponent(jobId)}`,
-      {
-        method:
-          "PATCH",
-
-        body:
-          JSON.stringify({
-
-            status:
-              "completed",
-
-            completed_at:
-              new Date().toISOString(),
-
-            updated_at:
-              new Date().toISOString()
-          })
-      }
-    );
-
-
-    return json({
-
-      success:
-        true,
-
-      version:
-        VERSION,
-
-      action:
-        "process",
-
-      job_id:
-        jobId,
-
-      message:
-        "Scrape completed.",
-
-      done:
-        true
-    });
-  }
-
-
-  // ----------------------------------------------------------
-  // Mark pages as processing
-  // ----------------------------------------------------------
-
-  const ids =
-    pending.map(
-      item => item.id
-    );
-
-
-  await supabaseRequest(
-    env,
-    `scrape_urls?id=in.(${ids.join(",")})`,
-    {
-      method:
-        "PATCH",
-
-      body:
-        JSON.stringify({
-
-          status:
-            "processing",
-
-          attempts:
-            1
-        })
-    }
-  );
-
-
-  const results = [];
-
-  let successCount = 0;
-
-  let failedCount = 0;
-
-
-  // ----------------------------------------------------------
-  // Process pages
-  // ----------------------------------------------------------
-
-  for (
-    const queueItem of pending
-  ) {
-
-    try {
-
-      const result =
-        await processPage(
-          queueItem,
-          job,
-          env
         );
 
+    } finally {
 
-      successCount++;
-
-
-      results.push({
-
-        url:
-          queueItem.url,
-
-        success:
-          true,
-
-        ...result
-      });
-
-
-      // ------------------------------------------------------
-      // Mark complete
-      // ------------------------------------------------------
-
-      await supabaseRequest(
-        env,
-        `scrape_urls?id=eq.${queueItem.id}`,
-        {
-          method:
-            "PATCH",
-
-          body:
-            JSON.stringify({
-
-              status:
-                "completed",
-
-              processed_at:
-                new Date().toISOString(),
-
-              error:
-                null
-            })
-        }
-      );
-
-    } catch (error) {
-
-      failedCount++;
-
-
-      const message =
-        error?.message ||
-        String(error);
-
-
-      results.push({
-
-        url:
-          queueItem.url,
-
-        success:
-          false,
-
-        error:
-          message
-      });
-
-
-      // ------------------------------------------------------
-      // Mark failed
-      // ------------------------------------------------------
-
-      await supabaseRequest(
-        env,
-        `scrape_urls?id=eq.${queueItem.id}`,
-        {
-          method:
-            "PATCH",
-
-          body:
-            JSON.stringify({
-
-              status:
-                "failed",
-
-              error:
-                message,
-
-              processed_at:
-                new Date().toISOString()
-            })
-        }
-      );
-    }
-  }
-
-
-  // ----------------------------------------------------------
-  // Update job counters
-  // ----------------------------------------------------------
-
-  await supabaseRequest(
-    env,
-    `scrape_jobs?id=eq.${encodeURIComponent(jobId)}`,
-    {
-      method:
-        "PATCH",
-
-      body:
-        JSON.stringify({
-
-          processed_urls:
-            Number(
-              job.processed_urls || 0
-            ) + successCount,
-
-          failed_urls:
-            Number(
-              job.failed_urls || 0
-            ) + failedCount,
-
-          updated_at:
-            new Date().toISOString()
-        })
-    }
-  );
-
-
-  return json({
-
-    success:
-      true,
-
-    version:
-      VERSION,
-
-    action:
-      "process",
-
-    job_id:
-      jobId,
-
-    pages_processed:
-      pending.length,
-
-    successful:
-      successCount,
-
-    failed:
-      failedCount,
-
-    results,
-
-    message:
-      "Call action=process again with the same job_id to continue."
-  });
-}
-
-
-// ============================================================
-// PROCESS ONE PAGE
-// ============================================================
-
-async function processPage(
-  queueItem,
-  job,
-  env
-) {
-
-  const url =
-    queueItem.url;
-
-
-  // ----------------------------------------------------------
-  // Download webpage
-  // ----------------------------------------------------------
-
-  const html =
-    await fetchText(
-      url
-    );
-
-
-  // ----------------------------------------------------------
-  // Extract headings + text
-  // ----------------------------------------------------------
-
-  const sections =
-    extractSections(
-      html
-    );
-
-
-  // ----------------------------------------------------------
-  // Extract JSON-LD
-  // ----------------------------------------------------------
-
-  const jsonLd =
-    extractJsonLd(
-      html
-    );
-
-
-  // ----------------------------------------------------------
-  // Extract internal links
-  // ----------------------------------------------------------
-
-  const links =
-    extractUsefulLinks(
-      html,
-      url,
-      job.website
-    );
-
-
-  // ----------------------------------------------------------
-  // Build database rows
-  // ----------------------------------------------------------
-
-  const rows =
-    buildBusinessRows({
-
-      applicationId:
-        job.application_id,
-
-      sourceUrl:
-        url,
-
-      sections,
-
-      jsonLd
-    });
-
-
-  // ----------------------------------------------------------
-  // Save data
-  // ----------------------------------------------------------
-
-  if (
-    rows.length > 0
-  ) {
-
-    await saveBusinessData(
-      env,
-      rows
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // Add discovered internal links
-  // ----------------------------------------------------------
-
-  if (
-    links.length > 0
-  ) {
-
-    const queueRows =
-      links.map(
-        link => ({
-
-          job_id:
-            job.id,
-
-          application_id:
-            job.application_id,
-
-          url:
-            link,
-
-          status:
-            "pending",
-
-          discovered_from:
-            url
-        })
-      );
-
-
-    await supabaseRequest(
-      env,
-      "scrape_urls?on_conflict=job_id,url",
-      {
-        method:
-          "POST",
-
-        headers: {
-          "Prefer":
-            "resolution=ignore-duplicates,return=minimal"
-        },
-
-        body:
-          JSON.stringify(
-            queueRows
-          )
-      }
-    );
-  }
-
-
-  return {
-
-    sections_found:
-      sections.length,
-
-    json_ld_blocks_found:
-      jsonLd.length,
-
-    useful_links_found:
-      links.length,
-
-    rows_prepared:
-      rows.length,
-
-    rows_saved:
-      rows.length
-  };
-}
-
-
-// ============================================================
-// EXTRACT HEADINGS + TEXT
-// ============================================================
-
-function extractSections(
-  html
-) {
-
-  const sections = [];
-
-
-  // ----------------------------------------------------------
-  // Remove scripts/styles
-  // ----------------------------------------------------------
-
-  const clean =
-    String(html || "")
-
-      .replace(
-        /<script[\s\S]*?<\/script>/gi,
-        " "
-      )
-
-      .replace(
-        /<style[\s\S]*?<\/style>/gi,
-        " "
-      )
-
-      .replace(
-        /<noscript[\s\S]*?<\/noscript>/gi,
-        " "
-      );
-
-
-  // ----------------------------------------------------------
-  // Find headings
-  // ----------------------------------------------------------
-
-  const headingRegex =
-    /<(h[1-6])[^>]*>([\s\S]*?)<\/\1>/gi;
-
-
-  const headings = [];
-
-
-  let match;
-
-
-  while (
-    (match =
-      headingRegex.exec(
-        clean
-      ))
-  ) {
-
-    const level =
-      match[1].toLowerCase();
-
-
-    const heading =
-      cleanHtml(
-        match[2]
-      );
-
-
-    if (!heading) {
-      continue;
-    }
-
-
-    headings.push({
-
-      level,
-
-      heading,
-
-      start:
-        match.index,
-
-      end:
-        headingRegex.lastIndex
-    });
-  }
-
-
-  // ----------------------------------------------------------
-  // Get text after each heading
-  // until next heading
-  // ----------------------------------------------------------
-
-  for (
-    let i = 0;
-    i < headings.length;
-    i++
-  ) {
-
-    const current =
-      headings[i];
-
-
-    const next =
-      headings[i + 1];
-
-
-    const rawText =
-      clean.substring(
-
-        current.end,
-
-        next
-          ? next.start
-          : clean.length
-      );
-
-
-    const text =
-      cleanHtml(
-        rawText
-      );
-
-
-    if (!text) {
-      continue;
-    }
-
-
-    sections.push({
-
-      level:
-        current.level,
-
-      heading:
-        current.heading,
-
-      text:
-        limitText(
-          text
-        )
-    });
-  }
-
-
-  return sections;
-}
-
-
-// ============================================================
-// EXTRACT JSON-LD
-// ============================================================
-
-function extractJsonLd(
-  html
-) {
-
-  const blocks = [];
-
-
-  const regex =
-    /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-
-
-  let match;
-
-
-  while (
-    (match =
-      regex.exec(html))
-  ) {
-
-    const raw =
-      match[1].trim();
-
-
-    try {
-
-      blocks.push(
-        JSON.parse(raw)
-      );
-
-    } catch {
-
-      // Ignore invalid JSON-LD
-    }
-  }
-
-
-  return blocks;
-}
-
-
-// ============================================================
-// EXTRACT INTERNAL LINKS
-// ============================================================
-
-function extractUsefulLinks(
-  html,
-  pageUrl,
-  origin
-) {
-
-  const links =
-    new Set();
-
-
-  const regex =
-    /<a[^>]+href=["']([^"']+)["'][^>]*>/gi;
-
-
-  let match;
-
-
-  while (
-    (match =
-      regex.exec(html))
-  ) {
-
-    const url =
-      normalizeUrl(
-        match[1],
-        pageUrl
-      );
-
-
-    if (!url) {
-      continue;
-    }
-
-
-    if (
-      !isSameOrigin(
-        url,
-        origin
-      )
-    ) {
-      continue;
-    }
-
-
-    // --------------------------------------------------------
-    // Ignore files
-    // --------------------------------------------------------
-
-    if (
-      /\.(pdf|jpg|jpeg|png|gif|svg|webp|mp4|mp3|zip|doc|docx|xls|xlsx)(\?|$)/i
-        .test(url)
-    ) {
-
-      continue;
-    }
-
-
-    links.add(url);
-
-
-    // Prevent huge queue additions
-    if (
-      links.size >= 100
-    ) {
-      break;
-    }
-  }
-
-
-  return [
-    ...links
-  ];
-}
-
-
-// ============================================================
-// BUILD BUSINESS DATA ROWS
-//
-// IMPORTANT:
-//
-// We deduplicate using:
-//
-// application_id
-// + source_url
-// + field
-//
-// This fixes:
-//
-// ON CONFLICT DO UPDATE command
-// cannot affect row a second time
-// ============================================================
-
-function buildBusinessRows({
-  applicationId,
-  sourceUrl,
-  sections,
-  jsonLd
-}) {
-
-  const rowMap =
-    new Map();
-
-
-  // ----------------------------------------------------------
-  // Add row helper
-  // ----------------------------------------------------------
-
-  function addRow(
-    field,
-    data
-  ) {
-
-    field =
-      cleanField(
-        field
-      );
-
-
-    if (!field) {
-      return;
-    }
-
-
-    const key =
-      `${applicationId}|${sourceUrl}|${field}`;
-
-
-    // --------------------------------------------------------
-    // Duplicate field on same page
-    // --------------------------------------------------------
-
-    if (
-      rowMap.has(key)
-    ) {
-
-      const existing =
-        rowMap.get(key);
-
-
-      const oldData =
-        String(
-          existing.data ?? ""
+        clearTimeout(
+            timer
         );
 
-
-      const newData =
-        typeof data === "string"
-          ? data
-          : JSON.stringify(data);
-
-
-      if (
-        newData &&
-        !oldData.includes(
-          newData
-        )
-      ) {
-
-        existing.data =
-          `${oldData}\n\n${newData}`;
-      }
-
-
-      return;
     }
 
-
-    // --------------------------------------------------------
-    // New row
-    // --------------------------------------------------------
-
-    rowMap.set(
-      key,
-      {
-
-        application_id:
-          applicationId,
-
-        field,
-
-        data:
-          typeof data === "string"
-            ? data
-            : JSON.stringify(data),
-
-        source_url:
-          sourceUrl,
-
-        updated_at:
-          new Date().toISOString()
-      }
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // Headings
-  // ----------------------------------------------------------
-
-  for (
-    const section of sections
-  ) {
-
-    addRow(
-      section.heading,
-      section.text
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // JSON-LD
-  // ----------------------------------------------------------
-
-  for (
-    const block of jsonLd
-  ) {
-
-    addStructuredData(
-      addRow,
-      block
-    );
-  }
-
-
-  return [
-    ...rowMap.values()
-  ];
 }
 
 
 // ============================================================
-// JSON-LD → STRUCTURED BUSINESS DATA
+// CHUNK ARRAY
 // ============================================================
 
-function addStructuredData(
-  addRow,
-  block
+function chunkArray(
+    array,
+    size
 ) {
 
-  if (
-    !block ||
-    typeof block !== "object"
-  ) {
-
-    return;
-  }
-
-
-  // ----------------------------------------------------------
-  // @graph
-  // ----------------------------------------------------------
-
-  if (
-    Array.isArray(
-      block["@graph"]
-    )
-  ) {
-
-    for (
-      const item of block["@graph"]
-    ) {
-
-      addStructuredData(
-        addRow,
-        item
-      );
-    }
-  }
-
-
-  // ----------------------------------------------------------
-  // Business name
-  // ----------------------------------------------------------
-
-  if (
-    block.name
-  ) {
-
-    addRow(
-      "structured_business_name",
-      block.name
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // Description
-  // ----------------------------------------------------------
-
-  if (
-    block.description
-  ) {
-
-    addRow(
-      "structured_description",
-      block.description
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // Phone
-  // ----------------------------------------------------------
-
-  if (
-    block.telephone
-  ) {
-
-    addRow(
-      "phone",
-      block.telephone
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // Email
-  // ----------------------------------------------------------
-
-  if (
-    block.email
-  ) {
-
-    addRow(
-      "email",
-      block.email
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // Price range
-  // ----------------------------------------------------------
-
-  if (
-    block.priceRange
-  ) {
-
-    addRow(
-      "price_range",
-      block.priceRange
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // Address
-  // ----------------------------------------------------------
-
-  if (
-    block.address
-  ) {
-
-    if (
-      typeof block.address ===
-      "string"
-    ) {
-
-      addRow(
-        "address",
-        block.address
-      );
-
-    } else if (
-      typeof block.address ===
-      "object"
-    ) {
-
-      const addressParts =
+    const result =
         [];
 
 
-      if (
-        block.address.streetAddress
-      ) {
+    for (
+        let i = 0;
+        i < array.length;
+        i += size
+    ) {
 
-        addressParts.push(
-          block.address.streetAddress
+        result.push(
+            array.slice(
+                i,
+                i + size
+            )
         );
-      }
 
-
-      if (
-        block.address.addressLocality
-      ) {
-
-        addressParts.push(
-          block.address.addressLocality
-        );
-      }
-
-
-      if (
-        block.address.addressRegion
-      ) {
-
-        addressParts.push(
-          block.address.addressRegion
-        );
-      }
-
-
-      if (
-        block.address.postalCode
-      ) {
-
-        addressParts.push(
-          block.address.postalCode
-        );
-      }
-
-
-      if (
-        addressParts.length
-      ) {
-
-        addRow(
-          "address",
-          addressParts.join(
-            ", "
-          )
-        );
-      }
     }
-  }
 
 
-  // ----------------------------------------------------------
-  // Opening hours
-  // ----------------------------------------------------------
+    return result;
 
-  if (
-    block.openingHours
-  ) {
-
-    addRow(
-      "opening_hours",
-      block.openingHours
-    );
-  }
-
-
-  if (
-    block.openingHoursSpecification
-  ) {
-
-    addRow(
-      "opening_hours",
-      block.openingHoursSpecification
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // Social profiles
-  // ----------------------------------------------------------
-
-  if (
-    Array.isArray(
-      block.sameAs
-    )
-  ) {
-
-    addRow(
-      "social_profiles",
-      block.sameAs
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // Service type
-  // ----------------------------------------------------------
-
-  if (
-    block.serviceType
-  ) {
-
-    addRow(
-      "service_type",
-      block.serviceType
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // URL
-  // ----------------------------------------------------------
-
-  if (
-    block.url
-  ) {
-
-    addRow(
-      "structured_url",
-      block.url
-    );
-  }
 }
 
 
 // ============================================================
-// SAVE BUSINESS DATA
+// JSON RESPONSE
 // ============================================================
 
-async function saveBusinessData(
-  env,
-  rows
+function jsonResponse(
+    data,
+    status = 200
 ) {
 
-  if (
-    !rows.length
-  ) {
+    return new Response(
 
-    return;
-  }
-
-
-  await supabaseRequest(
-    env,
-    "business_data?on_conflict=application_id,source_url,field",
-    {
-      method:
-        "POST",
-
-      headers: {
-
-        "Prefer":
-          "resolution=merge-duplicates,return=minimal"
-      },
-
-      body:
         JSON.stringify(
-          rows
-        )
-    }
-  );
+            data,
+            null,
+            2
+        ),
+
+        {
+
+            status,
+
+            headers: {
+
+                "Content-Type":
+                    "application/json",
+
+                ...corsHeaders()
+
+            }
+
+        }
+
+    );
+
 }
 
 
 // ============================================================
-// SCRAPE STATUS
+// CORS
 // ============================================================
 
-async function scrapeStatus(
-  body,
-  env
-) {
+function corsHeaders() {
 
-  const jobId =
-    String(
-      body.job_id || ""
-    ).trim();
+    return {
 
+        "Access-Control-Allow-Origin":
+            "*",
 
-  if (!jobId) {
+        "Access-Control-Allow-Methods":
+            "POST, OPTIONS",
 
-    return json({
-      success: false,
-      error:
-        "job_id is required"
-    }, 400);
-  }
+        "Access-Control-Allow-Headers":
+            "Content-Type, Authorization"
 
+    };
 
-  // ----------------------------------------------------------
-  // Get job
-  // ----------------------------------------------------------
-
-  const jobs =
-    await supabaseRequest(
-      env,
-      `scrape_jobs?id=eq.${encodeURIComponent(jobId)}&select=*`
-    );
-
-
-  if (
-    !Array.isArray(jobs) ||
-    jobs.length === 0
-  ) {
-
-    return json({
-      success: false,
-      error:
-        "Job not found"
-    }, 404);
-  }
-
-
-  const job =
-    jobs[0];
-
-
-  // ----------------------------------------------------------
-  // Pending
-  // ----------------------------------------------------------
-
-  const pending =
-    await supabaseRequest(
-      env,
-      `scrape_urls?job_id=eq.${encodeURIComponent(jobId)}&status=eq.pending&select=id&limit=5000`
-    );
-
-
-  // ----------------------------------------------------------
-  // Processing
-  // ----------------------------------------------------------
-
-  const processing =
-    await supabaseRequest(
-      env,
-      `scrape_urls?job_id=eq.${encodeURIComponent(jobId)}&status=eq.processing&select=id&limit=5000`
-    );
-
-
-  return json({
-
-    success:
-      true,
-
-    version:
-      VERSION,
-
-    job,
-
-    queue: {
-
-      pending:
-        Array.isArray(
-          pending
-        )
-          ? pending.length
-          : 0,
-
-      processing:
-        Array.isArray(
-          processing
-        )
-          ? processing.length
-          : 0
-    }
-  });
-}
-
-
-// ============================================================
-// CLEAN HTML
-// ============================================================
-
-function cleanHtml(
-  html
-) {
-
-  return String(
-    html || ""
-  )
-
-    .replace(
-      /<[^>]+>/g,
-      " "
-    )
-
-    .replace(
-      /&nbsp;/gi,
-      " "
-    )
-
-    .replace(
-      /&amp;/gi,
-      "&"
-    )
-
-    .replace(
-      /&quot;/gi,
-      '"'
-    )
-
-    .replace(
-      /&#39;/gi,
-      "'"
-    )
-
-    .replace(
-      /&lt;/gi,
-      "<"
-    )
-
-    .replace(
-      /&gt;/gi,
-      ">"
-    )
-
-    .replace(
-      /\s+/g,
-      " "
-    )
-
-    .trim();
-}
-
-
-// ============================================================
-// CLEAN FIELD
-// ============================================================
-
-function cleanField(
-  value
-) {
-
-  return String(
-    value || ""
-  )
-
-    .replace(
-      /\s+/g,
-      " "
-    )
-
-    .trim()
-
-    .slice(
-      0,
-      500
-    );
-}
-
-
-// ============================================================
-// LIMIT TEXT
-// ============================================================
-
-function limitText(
-  text
-) {
-
-  return String(
-    text || ""
-  )
-    .trim()
-    .slice(
-      0,
-      20000
-    );
-}
+                    }
