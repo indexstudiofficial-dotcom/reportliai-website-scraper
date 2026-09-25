@@ -1,15 +1,17 @@
 // ============================================================
 // Reportli AI Website Scraper
-// VERSION: 2026-09-25-V2
+// VERSION: 2026-09-25-V3
 // ============================================================
 
-const VERSION = "2026-09-25-V2";
+const VERSION = "2026-09-25-V3";
 
 const PAGES_PER_BATCH = 3;
 const MAX_AI_CALLS = 6;
 const MAX_CHUNKS_PER_PAGE = 2;
+
 const CHUNK_SIZE = 7000;
 const CHUNK_OVERLAP = 500;
+
 const FETCH_TIMEOUT = 15000;
 
 
@@ -23,8 +25,8 @@ export default {
     if (request.method !== "POST") {
       return json({
         success: false,
-        error: "POST required",
-        worker_version: VERSION
+        worker_version: VERSION,
+        error: "POST required"
       }, 405);
     }
 
@@ -47,40 +49,34 @@ export default {
       if (!applicationId) {
         return json({
           success: false,
-          error: "application_id required",
-          worker_version: VERSION
+          worker_version: VERSION,
+          error: "application_id required"
         }, 400);
       }
 
       if (!domain) {
         return json({
           success: false,
-          error: "domain required",
-          worker_version: VERSION
+          worker_version: VERSION,
+          error: "domain required"
         }, 400);
       }
-
-
-      // --------------------------------------------------------
-      // IMPORTANT:
-      // Only actual HTML pages are allowed here.
-      // --------------------------------------------------------
 
       const website =
         normalizeUrl(domain);
 
 
-      // --------------------------------------------------------
-      // Discover URLs
-      // --------------------------------------------------------
+      // ========================================================
+      // DISCOVER
+      // ========================================================
 
       const discovered =
         await discoverUrls(website);
 
 
-      // --------------------------------------------------------
-      // Remove XML and other files
-      // --------------------------------------------------------
+      // ========================================================
+      // ONLY REAL HTML PAGES
+      // ========================================================
 
       const pageUrls =
         Array.from(
@@ -92,9 +88,9 @@ export default {
         );
 
 
-      // --------------------------------------------------------
-      // Select batch
-      // --------------------------------------------------------
+      // ========================================================
+      // CURRENT BATCH
+      // ========================================================
 
       const selected =
         pageUrls.slice(
@@ -138,7 +134,7 @@ export default {
 
 
       // ========================================================
-      // PROCESS PAGES
+      // PROCESS EACH PAGE
       // ========================================================
 
       for (const pageUrl of selected) {
@@ -146,7 +142,7 @@ export default {
         try {
 
           // ----------------------------------------------------
-          // Fetch HTML
+          // FETCH
           // ----------------------------------------------------
 
           const html =
@@ -154,7 +150,7 @@ export default {
 
 
           // ----------------------------------------------------
-          // Extract text
+          // TEXT
           // ----------------------------------------------------
 
           const page =
@@ -169,7 +165,7 @@ export default {
 
 
           // ----------------------------------------------------
-          // Split page
+          // CHUNKS
           // ----------------------------------------------------
 
           const chunks =
@@ -188,7 +184,7 @@ export default {
 
 
           // ----------------------------------------------------
-          // AI
+          // SARVAM
           // ----------------------------------------------------
 
           for (const chunk of chunks) {
@@ -220,13 +216,23 @@ export default {
 
 
             for (
-              const item of result.fields
+              const item
+              of result.fields
             ) {
+
+              if (
+                !item ||
+                typeof item !== "object"
+              ) {
+                continue;
+              }
+
 
               const field =
                 cleanField(
                   item.field
                 );
+
 
               const data =
                 cleanData(
@@ -234,9 +240,8 @@ export default {
                 );
 
 
-              // NEVER save empty data.
+              // NEVER save empty values.
               if (!field) continue;
-
               if (!useful(data)) continue;
 
 
@@ -264,7 +269,7 @@ export default {
 
 
           // ----------------------------------------------------
-          // Prepare rows
+          // SUPABASE ROWS
           // ----------------------------------------------------
 
           const rows = [];
@@ -300,7 +305,7 @@ export default {
 
 
           // ----------------------------------------------------
-          // ONE Supabase request
+          // ONE BULK SAVE
           // ----------------------------------------------------
 
           if (rows.length > 0) {
@@ -372,6 +377,7 @@ export default {
         pageOffset +
         selected.length;
 
+
       const hasMore =
         nextOffset <
         pageUrls.length;
@@ -440,12 +446,37 @@ export default {
 
 
 // ============================================================
+// URL NORMALIZATION
+// ============================================================
+
+function normalizeUrl(value) {
+
+  try {
+
+    const url =
+      new URL(
+        String(value).trim()
+      );
+
+
+    // Remove #section
+    url.hash = "";
+
+
+    return url.href;
+
+  } catch {
+
+    return String(value).trim();
+  }
+}
+
+
+// ============================================================
 // DISCOVER URLS
 // ============================================================
 
-async function discoverUrls(
-  website
-) {
+async function discoverUrls(website) {
 
   const origin =
     new URL(website).origin;
@@ -462,10 +493,10 @@ async function discoverUrls(
 
 
   // ----------------------------------------------------------
-  // Sitemap
+  // Common sitemap locations
   // ----------------------------------------------------------
 
-  const sitemapUrls = [
+  const sitemapCandidates = [
 
     `${origin}/sitemap.xml`,
 
@@ -478,7 +509,7 @@ async function discoverUrls(
 
   for (
     const sitemap
-    of sitemapUrls
+    of sitemapCandidates
   ) {
 
     try {
@@ -500,12 +531,12 @@ async function discoverUrls(
       }
 
 
-      const text =
+      const xml =
         await response.text();
 
 
       const locations =
-        extractLocs(text);
+        extractLocs(xml);
 
 
       for (
@@ -513,10 +544,11 @@ async function discoverUrls(
         of locations
       ) {
 
-        // NEVER add XML files.
+        // Never add XML files.
         if (
           url
             .toLowerCase()
+            .split("?")[0]
             .endsWith(".xml")
         ) {
           continue;
@@ -531,18 +563,11 @@ async function discoverUrls(
             normalizeUrl(url)
           );
         }
-
-
-        if (
-          urls.size >= 127
-        ) {
-          break;
-        }
       }
 
 
-      // If we found real pages,
-      // stop checking other sitemap files.
+      // If this sitemap gave us pages,
+      // don't need other common sitemaps.
       if (
         urls.size > 1
       ) {
@@ -550,13 +575,13 @@ async function discoverUrls(
       }
 
     } catch {
-      // Ignore sitemap failure.
+      // Ignore.
     }
   }
 
 
   // ----------------------------------------------------------
-  // robots.txt
+  // robots.txt only if sitemap gave nothing
   // ----------------------------------------------------------
 
   if (
@@ -577,7 +602,7 @@ async function discoverUrls(
           await response.text();
 
 
-        const matches =
+        const sitemapMatches =
           robots.match(
             /^sitemap\s*:\s*(.+)$/gim
           ) || [];
@@ -585,7 +610,7 @@ async function discoverUrls(
 
         for (
           const line
-          of matches
+          of sitemapMatches
         ) {
 
           const sitemap =
@@ -650,12 +675,10 @@ async function discoverUrls(
 
 
 // ============================================================
-// EXTRACT <LOC>
+// EXTRACT SITEMAP LOCATIONS
 // ============================================================
 
-function extractLocs(
-  xml
-) {
+function extractLocs(xml) {
 
   const output = [];
 
@@ -674,8 +697,7 @@ function extractLocs(
     const url =
       decodeEntities(
         match[1]
-      )
-        .trim();
+      ).trim();
 
 
     if (url) {
@@ -689,12 +711,10 @@ function extractLocs(
 
 
 // ============================================================
-// CHECK HTML PAGE
+// HTML PAGE CHECK
 // ============================================================
 
-function isHtmlPage(
-  value
-) {
+function isHtmlPage(value) {
 
   try {
 
@@ -703,15 +723,15 @@ function isHtmlPage(
 
 
     const path =
-      url.pathname
-        .toLowerCase();
+      url.pathname.toLowerCase();
 
 
-    const blocked = [
+    const blockedExtensions = [
 
       ".xml",
       ".json",
       ".txt",
+
       ".jpg",
       ".jpeg",
       ".png",
@@ -719,24 +739,29 @@ function isHtmlPage(
       ".webp",
       ".svg",
       ".ico",
+
       ".pdf",
       ".zip",
       ".rar",
+
       ".mp3",
       ".mp4",
       ".mov",
       ".avi",
+
       ".css",
       ".js",
+
       ".woff",
       ".woff2",
-      ".ttf"
+      ".ttf",
+      ".eot"
     ];
 
 
     for (
       const extension
-      of blocked
+      of blockedExtensions
     ) {
 
       if (
@@ -763,9 +788,7 @@ function isHtmlPage(
 // FETCH HTML
 // ============================================================
 
-async function fetchHtml(
-  url
-) {
+async function fetchHtml(url) {
 
   const controller =
     new AbortController();
@@ -784,9 +807,12 @@ async function fetchHtml(
       await fetch(
         url,
         {
+
           headers: {
+
             "User-Agent":
               "ReportliAI/1.0",
+
             "Accept":
               "text/html,application/xhtml+xml"
           },
@@ -832,18 +858,16 @@ async function fetchHtml(
 
 
 // ============================================================
-// EXTRACT PAGE TEXT
+// EXTRACT READABLE TEXT
 // ============================================================
 
-function extractText(
-  html
-) {
+function extractText(html) {
 
   let value =
     String(html || "");
 
 
-  // Remove useless sections.
+  // Remove useless HTML sections.
   value =
     value.replace(
       /<(script|style|noscript|svg|canvas|iframe|nav|footer|aside|header)[^>]*>[\s\S]*?<\/\1>/gi,
@@ -851,7 +875,7 @@ function extractText(
     );
 
 
-  // Get title.
+  // Title.
   const titleMatch =
     value.match(
       /<title[^>]*>([\s\S]*?)<\/title>/i
@@ -868,7 +892,7 @@ function extractText(
       : "";
 
 
-  // Remove HTML.
+  // Remove HTML tags.
   value =
     value.replace(
       /<[^>]+>/g,
@@ -876,14 +900,12 @@ function extractText(
     );
 
 
-  // Decode.
+  // Decode entities.
   value =
     decodeEntities(value);
 
 
-  // IMPORTANT:
-  // This function is defined here.
-  // No "cleanText is not defined" error.
+  // Clean text.
   const text =
     cleanText(value);
 
@@ -899,9 +921,7 @@ function extractText(
 // CLEAN TEXT
 // ============================================================
 
-function cleanText(
-  value
-) {
+function cleanText(value) {
 
   return String(value || "")
     .replace(/\s+/g, " ")
@@ -910,12 +930,10 @@ function cleanText(
 
 
 // ============================================================
-// DECODE HTML
+// DECODE HTML ENTITIES
 // ============================================================
 
-function decodeEntities(
-  value
-) {
+function decodeEntities(value) {
 
   return String(value || "")
 
@@ -1111,8 +1129,10 @@ ${chunk}
 
 
       return {
+
         error:
           `Sarvam ${response.status}: ${error}`,
+
         fields: []
       };
     }
@@ -1132,8 +1152,10 @@ ${chunk}
     if (!content) {
 
       return {
+
         error:
           "Empty Sarvam response",
+
         fields: []
       };
     }
@@ -1146,16 +1168,16 @@ ${chunk}
 
       parsed =
         typeof content === "string"
-          ? JSON.parse(
-              content
-            )
+          ? JSON.parse(content)
           : content;
 
     } catch {
 
       return {
+
         error:
           "Invalid Sarvam JSON",
+
         fields: []
       };
     }
@@ -1177,6 +1199,7 @@ ${chunk}
   } catch (error) {
 
     return {
+
       error:
         error?.message ||
         String(error),
@@ -1188,12 +1211,10 @@ ${chunk}
 
 
 // ============================================================
-// FIELD CLEANING
+// CLEAN FIELD NAME
 // ============================================================
 
-function cleanField(
-  value
-) {
+function cleanField(value) {
 
   return String(value || "")
     .trim()
@@ -1214,12 +1235,10 @@ function cleanField(
 
 
 // ============================================================
-// DATA CLEANING
+// CLEAN DATA
 // ============================================================
 
-function cleanData(
-  value
-) {
+function cleanData(value) {
 
   if (
     value === null ||
@@ -1277,12 +1296,10 @@ function cleanData(
 
 
 // ============================================================
-// USEFUL DATA CHECK
+// USEFUL DATA
 // ============================================================
 
-function useful(
-  value
-) {
+function useful(value) {
 
   if (
     value === null ||
@@ -1325,7 +1342,7 @@ function useful(
 
 
 // ============================================================
-// MERGE DATA
+// MERGE
 // ============================================================
 
 function merge(
@@ -1333,16 +1350,12 @@ function merge(
   newValue
 ) {
 
-  if (
-    !useful(oldValue)
-  ) {
+  if (!useful(oldValue)) {
     return newValue;
   }
 
 
-  if (
-    !useful(newValue)
-  ) {
+  if (!useful(newValue)) {
     return oldValue;
   }
 
@@ -1410,14 +1423,12 @@ function merge(
 
 
 // ============================================================
-// UNIQUE
+// UNIQUE VALUES
 // ============================================================
 
-function unique(
-  values
-) {
+function unique(values) {
 
-  const result = [];
+  const output = [];
   const seen = new Set();
 
 
@@ -1440,16 +1451,16 @@ function unique(
 
 
     seen.add(key);
-    result.push(value);
+    output.push(value);
   }
 
 
-  return result;
+  return output;
 }
 
 
 // ============================================================
-// SUPABASE SAVE
+// SUPABASE BULK SAVE
 // ============================================================
 
 async function saveRows(
@@ -1459,14 +1470,14 @@ async function saveRows(
 
   try {
 
-    const url =
+    const endpoint =
       `${env.SUPABASE_URL}/rest/v1/business_data` +
       "?on_conflict=application_id,source_url,field";
 
 
     const response =
       await fetch(
-        url,
+        endpoint,
         {
 
           method: "POST",
@@ -1499,6 +1510,7 @@ async function saveRows(
 
 
       return {
+
         success: false,
 
         error:
@@ -1515,6 +1527,7 @@ async function saveRows(
   } catch (error) {
 
     return {
+
       success: false,
 
       error:
@@ -1553,4 +1566,4 @@ function json(
       }
     }
   );
-              }
+            }
