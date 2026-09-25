@@ -1,25 +1,35 @@
 // ============================================================
-// REPORTLI AI
-// WEBSITE KNOWLEDGE EXTRACTOR
+// AI BUSINESS WEBSITE KNOWLEDGE SCRAPER
+// Cloudflare Worker + Sarvam 105B + Supabase
 //
-// CLOUDFLARE WORKER
-// SUPABASE + SARVAM 105B
+// MAIN FLOW:
 //
-// ENVIRONMENT VARIABLES:
+// Website
+//   ↓
+// Discover pages
+//   ↓
+// Select small batch
+//   ↓
+// Fetch HTML
+//   ↓
+// Extract readable text
+//   ↓
+// Split very large pages into chunks
+//   ↓
+// Sarvam 105B extracts structured business facts
+//   ↓
+// Merge fields from all chunks
+//   ↓
+// ONE BULK SUPABASE UPSERT PER PAGE
 //
-// SUPABASE_URL
-// SUPABASE_SECRET_KEY
-// SARVAM_API_KEY
+// IMPORTANT:
+// This Worker is designed for Cloudflare FREE limits.
 //
-// INPUT:
+// Cloudflare Free:
+//   50 external subrequests / invocation
 //
-// {
-//   "application_id": "app-123",
-//   "domain": "https://example.com",
-//   "max_pages": 5,
-//   "page_offset": 0
-// }
-//
+// We deliberately keep the batch small and control the
+// maximum number of Sarvam requests.
 // ============================================================
 
 
@@ -30,58 +40,90 @@
 const CONFIG = {
 
   // ----------------------------------------------------------
-  // How many pages to process in one Worker request
+  // BATCH SIZE
   // ----------------------------------------------------------
 
-  DEFAULT_MAX_PAGES: 5,
-
-  MAX_PAGES_PER_REQUEST: 10,
-
+  // Number of pages processed in one Worker invocation.
+  //
+  // Example:
+  // page_offset = 0 → pages 1-5
+  // page_offset = 5 → pages 6-10
+  // page_offset = 10 → pages 11-15
+  //
+  // Keep this around 3-5 on Cloudflare Free.
+  MAX_PAGES_PER_INVOCATION: 5,
 
   // ----------------------------------------------------------
-  // Website limits
+  // AI SAFETY LIMIT
   // ----------------------------------------------------------
 
-  MAX_HTML_BYTES: 2_000_000,
+  // Maximum number of Sarvam requests in one Worker invocation.
+  //
+  // This prevents a very large page from consuming all
+  // Cloudflare subrequests.
+  MAX_AI_CALLS_PER_INVOCATION: 20,
 
+  // Maximum chunks allowed for one page.
+  MAX_CHUNKS_PER_PAGE: 4,
+
+  // ----------------------------------------------------------
+  // TEXT CHUNKING
+  // ----------------------------------------------------------
+
+  // Character size of each chunk sent to Sarvam.
+  //
+  // 12,000 characters is deliberately conservative.
+  // Sarvam 105B supports a much larger context window, but
+  // smaller chunks make extraction more reliable and keep
+  // Worker/API requests manageable.
+  CHUNK_SIZE: 12000,
+
+  // Overlap helps avoid losing facts at chunk boundaries.
+  CHUNK_OVERLAP: 800,
+
+  // ----------------------------------------------------------
+  // WEBSITE FETCH
+  // ----------------------------------------------------------
+
+  // Maximum HTML downloaded from one page.
+  MAX_HTML_BYTES: 2 * 1024 * 1024,
+
+  // Timeout for website fetch.
+  FETCH_TIMEOUT_MS: 12000,
+
+  // ----------------------------------------------------------
+  // DISCOVERY
+  // ----------------------------------------------------------
+
+  // Maximum URLs kept from sitemap/link discovery.
   MAX_DISCOVERED_URLS: 500,
 
-  MAX_SITEMAPS: 20,
-
-
-  // ----------------------------------------------------------
-  // IMPORTANT:
-  //
-  // Do NOT send an entire webpage to Sarvam.
-  //
-  // Smaller chunks make extraction much more reliable.
-  // ----------------------------------------------------------
-
-  CHUNK_SIZE: 6000,
-
-  CHUNK_OVERLAP: 500,
-
-  MAX_CHUNKS_PER_PAGE: 50,
-
+  // Maximum sitemap files we will inspect.
+  MAX_SITEMAPS: 10,
 
   // ----------------------------------------------------------
-  // Request timeout
+  // AI
   // ----------------------------------------------------------
 
-  WEBSITE_TIMEOUT: 15000,
+  SARVAM_MODEL: "sarvam-105b",
 
-  SARVAM_TIMEOUT: 60000,
-
+  // Structured extraction does not need heavy reasoning.
+  // Sarvam supports disabling reasoning for this kind of
+  // latency/cost-sensitive extraction.
+  REASONING_EFFORT: null,
 
   // ----------------------------------------------------------
-  // Sarvam
+  // SUPABASE
   // ----------------------------------------------------------
 
-  SARVAM_URL:
-    "https://api.sarvam.ai/v1/chat/completions",
+  SUPABASE_TABLE: "business_data",
 
-  SARVAM_MODEL:
-    "sarvam-105b"
+  // ----------------------------------------------------------
+  // USER AGENT
+  // ----------------------------------------------------------
+
+  USER_AGENT:
+    "Mozilla/5.0 (compatible; AI-Business-Knowledge-Bot/1.0; +https://reportliai.sbs)"
 };
 
 
@@ -91,344 +133,369 @@ const CONFIG = {
 
 export default {
 
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
 
     // --------------------------------------------------------
     // CORS
     // --------------------------------------------------------
 
     if (request.method === "OPTIONS") {
-
       return new Response(null, {
         status: 204,
         headers: corsHeaders()
       });
-
     }
 
-
     // --------------------------------------------------------
-    // POST ONLY
+    // ONLY POST
     // --------------------------------------------------------
 
     if (request.method !== "POST") {
+      return jsonResponse(
+        {
+          success: false,
+          error: "Only POST requests are supported."
+        },
+        405
+      );
+    }
+
+    // --------------------------------------------------------
+    // ENVIRONMENT VARIABLES
+    // --------------------------------------------------------
+
+    const requiredEnv = [
+      "SUPABASE_URL",
+      "SUPABASE_SECRET_KEY",
+      "SARVAM_API_KEY"
+    ];
+
+    const missingEnv = requiredEnv.filter(
+      key => !env[key]
+    );
+
+    if (missingEnv.length > 0) {
+      return jsonResponse(
+        {
+          success: false,
+          error: "Missing environment variables.",
+          missing: missingEnv
+        },
+        500
+      );
+    }
+
+    // --------------------------------------------------------
+    // PARSE BODY
+    // --------------------------------------------------------
+
+    let body;
+
+    try {
+      body = await request.json();
+    } catch {
+      return jsonResponse(
+        {
+          success: false,
+          error: "Request body must be valid JSON."
+        },
+        400
+      );
+    }
+
+    // --------------------------------------------------------
+    // INPUT
+    // --------------------------------------------------------
+
+    const applicationId =
+      String(body.application_id || "").trim();
+
+    const websiteInput =
+      String(
+        body.domain ||
+        body.website ||
+        body.website_url ||
+        ""
+      ).trim();
+
+    const requestedMaxPages =
+      Number(body.max_pages);
+
+    const pageOffset =
+      Math.max(
+        0,
+        Number.isFinite(Number(body.page_offset))
+          ? Number(body.page_offset)
+          : 0
+      );
+
+    // --------------------------------------------------------
+    // VALIDATE APPLICATION ID
+    // --------------------------------------------------------
+
+    if (!applicationId) {
+      return jsonResponse(
+        {
+          success: false,
+          error: "application_id is required."
+        },
+        400
+      );
+    }
+
+    // --------------------------------------------------------
+    // VALIDATE WEBSITE
+    // --------------------------------------------------------
+
+    if (!websiteInput) {
+      return jsonResponse(
+        {
+          success: false,
+          error: "domain or website_url is required."
+        },
+        400
+      );
+    }
+
+    // --------------------------------------------------------
+    // NORMALIZE WEBSITE
+    // --------------------------------------------------------
+
+    let website;
+
+    try {
+      website = normalizeWebsite(websiteInput);
+    } catch {
+      return jsonResponse(
+        {
+          success: false,
+          error: "Invalid website URL."
+        },
+        400
+      );
+    }
+
+    // --------------------------------------------------------
+    // PAGE LIMIT
+    // --------------------------------------------------------
+
+    let pagesPerInvocation =
+      CONFIG.MAX_PAGES_PER_INVOCATION;
+
+    if (
+      Number.isFinite(requestedMaxPages) &&
+      requestedMaxPages > 0
+    ) {
+      pagesPerInvocation =
+        Math.min(
+          Math.floor(requestedMaxPages),
+          CONFIG.MAX_PAGES_PER_INVOCATION
+        );
+    }
+
+    // --------------------------------------------------------
+    // SUBREQUEST BUDGET
+    // --------------------------------------------------------
+
+    const budget = {
+      websiteFetches: 0,
+      aiCalls: 0,
+      supabaseWrites: 0,
+      discoveryRequests: 0
+    };
+
+    // --------------------------------------------------------
+    // DISCOVER WEBSITE URLS
+    // --------------------------------------------------------
+
+    let discoveredUrls = [];
+
+    try {
+
+      discoveredUrls =
+        await discoverWebsiteUrls(
+          website,
+          budget
+        );
+
+    } catch (error) {
 
       return jsonResponse(
         {
           success: false,
-          error: "Only POST requests are allowed."
+          application_id: applicationId,
+          website,
+          error:
+            "Website URL discovery failed.",
+          details: safeError(error)
         },
-        405
+        500
       );
-
     }
 
+    // --------------------------------------------------------
+    // FALLBACK
+    // --------------------------------------------------------
 
-    try {
+    if (discoveredUrls.length === 0) {
+      discoveredUrls = [website];
+    }
 
-      // ======================================================
-      // CHECK ENVIRONMENT
-      // ======================================================
+    // --------------------------------------------------------
+    // DEDUPLICATE
+    // --------------------------------------------------------
 
-      if (!env.SUPABASE_URL) {
-
-        throw new Error(
-          "SUPABASE_URL secret is missing."
+    discoveredUrls =
+      uniqueUrls(discoveredUrls)
+        .slice(
+          0,
+          CONFIG.MAX_DISCOVERED_URLS
         );
 
+    // --------------------------------------------------------
+    // SELECT BATCH
+    // --------------------------------------------------------
+
+    const selectedUrls =
+      discoveredUrls.slice(
+        pageOffset,
+        pageOffset + pagesPerInvocation
+      );
+
+    // --------------------------------------------------------
+    // RESULT COUNTERS
+    // --------------------------------------------------------
+
+    const stats = {
+
+      pages_discovered:
+        discoveredUrls.length,
+
+      pages_selected:
+        selectedUrls.length,
+
+      pages_processed: 0,
+
+      pages_failed: 0,
+
+      chunks_sent_to_ai: 0,
+
+      fields_extracted: 0,
+
+      fields_saved: 0,
+
+      fields_failed: 0,
+
+      sarvam_errors: 0
+    };
+
+    const pageResults = [];
+
+    // --------------------------------------------------------
+    // PROCESS EACH PAGE
+    // --------------------------------------------------------
+
+    for (const pageUrl of selectedUrls) {
+
+      // ------------------------------------------------------
+      // CHECK AI BUDGET
+      // ------------------------------------------------------
+
+      if (
+        budget.aiCalls >=
+        CONFIG.MAX_AI_CALLS_PER_INVOCATION
+      ) {
+
+        pageResults.push({
+          url: pageUrl,
+          success: false,
+          error:
+            "AI request budget reached. Continue with the next page_offset."
+        });
+
+        stats.pages_failed++;
+
+        continue;
       }
 
-      if (!env.SUPABASE_SECRET_KEY) {
+      // ------------------------------------------------------
+      // PROCESS PAGE
+      // ------------------------------------------------------
 
-        throw new Error(
-          "SUPABASE_SECRET_KEY secret is missing."
-        );
+      try {
 
-      }
+        const result =
+          await processPage(
+            pageUrl,
+            applicationId,
+            env,
+            budget
+          );
 
-      if (!env.SARVAM_API_KEY) {
+        // ----------------------------------------------------
+        // UPDATE STATS
+        // ----------------------------------------------------
 
-        throw new Error(
-          "SARVAM_API_KEY secret is missing."
-        );
+        stats.chunks_sent_to_ai +=
+          result.chunks_sent_to_ai;
 
-      }
+        stats.fields_extracted +=
+          result.fields_extracted;
 
+        stats.fields_saved +=
+          result.fields_saved;
 
-      // ======================================================
-      // READ BODY
-      // ======================================================
+        stats.fields_failed +=
+          result.fields_failed;
 
-      const body =
-        await request.json();
+        stats.sarvam_errors +=
+          result.sarvam_errors;
 
-
-      const applicationId =
-        body.application_id ||
-        body.applicationId;
-
-
-      const websiteInput =
-        body.domain ||
-        body.website_url ||
-        body.websiteUrl;
-
-
-      if (!applicationId) {
-
-        return jsonResponse(
-          {
-            success: false,
-            error:
-              "application_id is required."
-          },
-          400
-        );
-
-      }
-
-
-      if (!websiteInput) {
-
-        return jsonResponse(
-          {
-            success: false,
-            error:
-              "domain or website_url is required."
-          },
-          400
-        );
-
-      }
-
-
-      // ======================================================
-      // PAGE BATCH
-      // ======================================================
-
-      let maxPages =
-        Number(body.max_pages) ||
-        CONFIG.DEFAULT_MAX_PAGES;
-
-
-      maxPages =
-        Math.max(
-          1,
-          Math.min(
-            maxPages,
-            CONFIG.MAX_PAGES_PER_REQUEST
-          )
-        );
-
-
-      let pageOffset =
-        Number(body.page_offset) || 0;
-
-
-      pageOffset =
-        Math.max(
-          0,
-          pageOffset
-        );
-
-
-      // ======================================================
-      // NORMALIZE WEBSITE
-      // ======================================================
-
-      const websiteUrl =
-        normalizeWebsiteUrl(
-          websiteInput
-        );
-
-
-      // ======================================================
-      // VERIFY APPLICATION
-      // ======================================================
-
-      const application =
-        await getApplication(
-          env,
-          applicationId
-        );
-
-
-      if (!application) {
-
-        return jsonResponse(
-          {
-            success: false,
-            error:
-              "Application not found."
-          },
-          404
-        );
-
-      }
-
-
-      // ======================================================
-      // DISCOVER PAGES
-      // ======================================================
-
-      const discovery =
-        await discoverPages(
-          websiteUrl
-        );
-
-
-      const allPages =
-        discovery.urls;
-
-
-      // ======================================================
-      // SELECT CURRENT BATCH
-      // ======================================================
-
-      const pages =
-        allPages.slice(
-          pageOffset,
-          pageOffset + maxPages
-        );
-
-
-      // ======================================================
-      // STATS
-      // ======================================================
-
-      const stats = {
-
-        pages_discovered:
-          allPages.length,
-
-        pages_selected:
-          pages.length,
-
-        pages_processed:
-          0,
-
-        pages_failed:
-          0,
-
-        chunks_sent_to_ai:
-          0,
-
-        fields_extracted:
-          0,
-
-        fields_saved:
-          0,
-
-        fields_failed:
-          0,
-
-        sarvam_errors:
-          0
-
-      };
-
-
-      const pageResults = [];
-
-
-      // ======================================================
-      // PROCESS EACH PAGE
-      // ======================================================
-
-      for (const pageUrl of pages) {
-
-        try {
-
-          const result =
-            await processPage(
-              env,
-              applicationId,
-              pageUrl
-            );
-
+        if (result.success) {
 
           stats.pages_processed++;
 
-
-          stats.chunks_sent_to_ai +=
-            result.chunks_sent_to_ai;
-
-
-          stats.fields_extracted +=
-            result.fields_extracted;
-
-
-          stats.fields_saved +=
-            result.fields_saved;
-
-
-          stats.fields_failed +=
-            result.fields_failed;
-
-
-          stats.sarvam_errors +=
-            result.sarvam_errors;
-
-
-          pageResults.push({
-
-            url: pageUrl,
-
-            success: true,
-
-            ...result
-
-          });
-
-
-        } catch (error) {
+        } else {
 
           stats.pages_failed++;
-
-
-          pageResults.push({
-
-            url: pageUrl,
-
-            success: false,
-
-            error:
-              error.message
-
-          });
-
         }
 
+        pageResults.push(result);
+
+      } catch (error) {
+
+        stats.pages_failed++;
+
+        pageResults.push({
+          url: pageUrl,
+          success: false,
+          error: safeError(error)
+        });
       }
+    }
 
+    // --------------------------------------------------------
+    // PAGINATION
+    // --------------------------------------------------------
 
-      // ======================================================
-      // PAGINATION
-      // ======================================================
+    const nextOffset =
+      pageOffset + selectedUrls.length;
 
-      const nextOffset =
-        pageOffset +
-        pages.length;
+    const hasMorePages =
+      nextOffset < discoveredUrls.length;
 
+    // --------------------------------------------------------
+    // RESPONSE
+    // --------------------------------------------------------
 
-      const hasMore =
-        nextOffset <
-        allPages.length;
-
-
-      // ======================================================
-      // RESPONSE
-      // ======================================================
-
-      return jsonResponse({
-
+    return jsonResponse(
+      {
         success: true,
 
         application_id:
           applicationId,
 
-        website:
-          websiteUrl,
+        website,
 
         stats,
 
@@ -438,50 +505,43 @@ export default {
             pageOffset,
 
           next_offset:
-            hasMore
+            hasMorePages
               ? nextOffset
               : null,
 
           has_more_pages:
-            hasMore,
+            hasMorePages,
 
           total_pages:
-            allPages.length
+            discoveredUrls.length
+        },
 
+        budget: {
+
+          website_fetches:
+            budget.websiteFetches,
+
+          ai_calls:
+            budget.aiCalls,
+
+          supabase_writes:
+            budget.supabaseWrites,
+
+          discovery_requests:
+            budget.discoveryRequests
         },
 
         page_results:
           pageResults,
 
         message:
-          hasMore
+          hasMorePages
             ? `Batch completed. Continue with page_offset=${nextOffset}.`
-            : "All discovered pages processed."
-
-      });
-
-
-    } catch (error) {
-
-      console.error(
-        "WORKER_ERROR",
-        error
-      );
-
-
-      return jsonResponse(
-        {
-          success: false,
-          error:
-            error.message
-        },
-        500
-      );
-
-    }
-
+            : "All discovered pages have been processed."
+      },
+      200
+    );
   }
-
 };
 
 
@@ -490,448 +550,787 @@ export default {
 // ============================================================
 
 async function processPage(
-  env,
+  pageUrl,
   applicationId,
-  pageUrl
+  env,
+  budget
 ) {
 
+  const result = {
 
-  // ==========================================================
-  // DOWNLOAD PAGE
-  // ==========================================================
+    url: pageUrl,
 
-  const response =
-    await fetchWithTimeout(
-      pageUrl,
-      {
-        method: "GET",
+    success: false,
 
-        headers: {
+    chunks_sent_to_ai: 0,
 
-          "User-Agent":
-            "ReportliAI-KnowledgeBot/1.0",
+    fields_extracted: 0,
 
-          "Accept":
-            "text/html,application/xhtml+xml"
+    fields_saved: 0,
 
-        }
-      },
-      CONFIG.WEBSITE_TIMEOUT
-    );
+    fields_failed: 0,
+
+    sarvam_errors: 0
+  };
 
 
-  if (!response.ok) {
-
-    throw new Error(
-      `Page returned HTTP ${response.status}`
-    );
-
-  }
-
-
-  // ==========================================================
-  // CHECK CONTENT TYPE
-  // ==========================================================
-
-  const contentType =
-    response.headers.get(
-      "content-type"
-    ) || "";
-
+  // ----------------------------------------------------------
+  // FETCH PAGE
+  // ----------------------------------------------------------
 
   if (
-    !contentType.includes("text/html") &&
-    !contentType.includes(
-      "application/xhtml+xml"
-    )
+    budget.websiteFetches >=
+    CONFIG.MAX_PAGES_PER_INVOCATION
   ) {
 
     throw new Error(
-      `Not an HTML page: ${contentType}`
+      "Website fetch safety limit reached."
     );
-
   }
-
-
-  // ==========================================================
-  // READ HTML
-  // ==========================================================
 
   const html =
-    await readLimitedText(
-      response,
-      CONFIG.MAX_HTML_BYTES
+    await fetchHtml(
+      pageUrl,
+      budget
     );
 
 
-  // ==========================================================
-  // CLEAN HTML
-  // ==========================================================
+  // ----------------------------------------------------------
+  // EXTRACT READABLE TEXT
+  // ----------------------------------------------------------
 
-  const page =
+  const pageData =
     extractReadableContent(
-      html
+      html,
+      pageUrl
     );
 
 
-  if (!page.text.trim()) {
+  // ----------------------------------------------------------
+  // IF PAGE HAS LITTLE CONTENT
+  // ----------------------------------------------------------
 
-    throw new Error(
-      "No readable content found."
-    );
+  if (
+    !pageData.text ||
+    pageData.text.length < 50
+  ) {
 
+    result.success = true;
+
+    result.chunks_sent_to_ai = 0;
+
+    result.fields_extracted = 0;
+
+    result.fields_saved = 0;
+
+    return result;
   }
 
 
-  // ==========================================================
-  // SPLIT PAGE INTO SMALL CHUNKS
-  // ==========================================================
+  // ----------------------------------------------------------
+  // CREATE CHUNKS
+  // ----------------------------------------------------------
 
-  const chunks =
-    createChunks(
-      page.text,
+  let chunks =
+    splitTextIntoChunks(
+      pageData.text,
       CONFIG.CHUNK_SIZE,
       CONFIG.CHUNK_OVERLAP
     );
 
 
-  // ==========================================================
-  // LIMIT SAFETY
-  // ==========================================================
+  // ----------------------------------------------------------
+  // LIMIT CHUNKS
+  // ----------------------------------------------------------
 
-  const limitedChunks =
-    chunks.slice(
-      0,
-      CONFIG.MAX_CHUNKS_PER_PAGE
-    );
-
-
-  let chunksSent = 0;
-
-  let fieldsExtracted = 0;
-
-  let fieldsSaved = 0;
-
-  let fieldsFailed = 0;
-
-  let sarvamErrors = 0;
-
-
-  // ==========================================================
-  // PROCESS CHUNKS ONE BY ONE
-  // ==========================================================
-
-  for (
-    let index = 0;
-    index < limitedChunks.length;
-    index++
+  if (
+    chunks.length >
+    CONFIG.MAX_CHUNKS_PER_PAGE
   ) {
 
-    const chunk =
-      limitedChunks[index];
-
-
-    try {
-
-      // ------------------------------------------------------
-      // SEND SMALL CHUNK TO SARVAM
-      // ------------------------------------------------------
-
-      const extracted =
-        await extractChunkWithSarvam(
-          env,
-          {
-            url:
-              pageUrl,
-
-            title:
-              page.title,
-
-            chunk:
-              chunk,
-
-            chunkNumber:
-              index + 1,
-
-            totalChunks:
-              limitedChunks.length
-          }
-        );
-
-
-      chunksSent++;
-
-
-      // ------------------------------------------------------
-      // NORMALIZE FIELDS
-      // ------------------------------------------------------
-
-      const fields =
-        normalizeFields(
-          extracted?.fields
-        );
-
-
-      fieldsExtracted +=
-        fields.length;
-
-
-      // ------------------------------------------------------
-      // SAVE EACH FIELD
-      // ------------------------------------------------------
-
-      for (
-        const item of fields
-      ) {
-
-        try {
-
-          await saveBusinessData(
-            env,
-
-            applicationId,
-
-            item.field,
-
-            item.data,
-
-            pageUrl
-          );
-
-
-          fieldsSaved++;
-
-
-        } catch (error) {
-
-          fieldsFailed++;
-
-
-          console.error(
-            "SAVE_FIELD_ERROR",
-            {
-              pageUrl,
-              field:
-                item.field,
-              error:
-                error.message
-            }
-          );
-
-        }
-
-      }
-
-
-    } catch (error) {
-
-      sarvamErrors++;
-
-
-      console.error(
-        "SARVAM_CHUNK_ERROR",
-        {
-          pageUrl,
-          chunk:
-            index + 1,
-          error:
-            error.message
-        }
+    chunks =
+      chunks.slice(
+        0,
+        CONFIG.MAX_CHUNKS_PER_PAGE
       );
-
-
-      // ------------------------------------------------------
-      // IMPORTANT:
-      //
-      // One bad chunk should NOT stop the entire page.
-      // ------------------------------------------------------
-
-      continue;
-
-    }
-
   }
 
 
-  return {
+  // ----------------------------------------------------------
+  // MERGED FIELDS FROM ALL CHUNKS
+  // ----------------------------------------------------------
 
-    chunks_sent_to_ai:
-      chunksSent,
+  const mergedFields =
+    new Map();
 
-    fields_extracted:
-      fieldsExtracted,
 
-    fields_saved:
-      fieldsSaved,
+  // ----------------------------------------------------------
+  // PROCESS CHUNKS
+  // ----------------------------------------------------------
 
-    fields_failed:
-      fieldsFailed,
+  for (
+    let chunkIndex = 0;
+    chunkIndex < chunks.length;
+    chunkIndex++
+  ) {
 
-    sarvam_errors:
-      sarvamErrors
+    // --------------------------------------------------------
+    // AI SAFETY LIMIT
+    // --------------------------------------------------------
 
-  };
+    if (
+      budget.aiCalls >=
+      CONFIG.MAX_AI_CALLS_PER_INVOCATION
+    ) {
 
+      break;
+    }
+
+    const chunk =
+      chunks[chunkIndex];
+
+
+    // --------------------------------------------------------
+    // SEND TO SARVAM
+    // --------------------------------------------------------
+
+    let extracted;
+
+    try {
+
+      extracted =
+        await extractWithSarvam(
+          {
+            url: pageUrl,
+            title: pageData.title,
+            chunk,
+            chunkIndex,
+            totalChunks: chunks.length
+          },
+          env,
+          budget
+        );
+
+    } catch (error) {
+
+      result.sarvam_errors++;
+
+      continue;
+    }
+
+
+    // --------------------------------------------------------
+    // COUNT
+    // --------------------------------------------------------
+
+    result.chunks_sent_to_ai++;
+
+
+    // --------------------------------------------------------
+    // MERGE FIELDS
+    // --------------------------------------------------------
+
+    for (
+      const field of extracted
+    ) {
+
+      const normalized =
+        normalizeField(
+          field
+        );
+
+      if (!normalized) {
+        continue;
+      }
+
+
+      result.fields_extracted++;
+
+
+      // ------------------------------------------------------
+      // MERGE SAME FIELD
+      // ------------------------------------------------------
+
+      if (
+        mergedFields.has(
+          normalized.field
+        )
+      ) {
+
+        const previous =
+          mergedFields.get(
+            normalized.field
+          );
+
+        previous.data =
+          mergeValues(
+            previous.data,
+            normalized.data
+          );
+
+      } else {
+
+        mergedFields.set(
+          normalized.field,
+          {
+            field:
+              normalized.field,
+
+            data:
+              normalized.data
+          }
+        );
+      }
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // NO AI DATA
+  // ----------------------------------------------------------
+
+  if (
+    mergedFields.size === 0
+  ) {
+
+    result.success =
+      result.sarvam_errors === 0;
+
+    return result;
+  }
+
+
+  // ----------------------------------------------------------
+  // PREPARE BULK ROWS
+  // ----------------------------------------------------------
+
+  const rows = [];
+
+  for (
+    const item of mergedFields.values()
+  ) {
+
+    rows.push({
+
+      application_id:
+        applicationId,
+
+      field:
+        item.field,
+
+      data:
+        item.data,
+
+      source_url:
+        pageUrl,
+
+      updated_at:
+        new Date().toISOString()
+    });
+  }
+
+
+  // ----------------------------------------------------------
+  // ONE SUPABASE WRITE
+  // ----------------------------------------------------------
+
+  try {
+
+    const saved =
+      await bulkSaveToSupabase(
+        rows,
+        env,
+        budget
+      );
+
+
+    // --------------------------------------------------------
+    // COUNT SUCCESSFUL ROWS
+    // --------------------------------------------------------
+
+    result.fields_saved =
+      saved.saved;
+
+
+    result.fields_failed =
+      saved.failed;
+
+
+    result.success =
+      saved.failed === 0;
+
+  } catch (error) {
+
+    result.success = false;
+
+    result.fields_failed =
+      rows.length;
+
+    result.error =
+      safeError(error);
+  }
+
+
+  return result;
 }
 
 
 // ============================================================
-// SARVAM 105B EXTRACTION
+// FETCH HTML
 // ============================================================
 
-async function extractChunkWithSarvam(
-  env,
-  input
+async function fetchHtml(
+  url,
+  budget
 ) {
 
-
-  // ==========================================================
-  // SYSTEM PROMPT
-  //
-  // SHORT ON PURPOSE.
-  //
-  // We don't want a giant instruction prompt repeated
-  // for every large website page.
-  // ==========================================================
-
-  const systemPrompt = `
-You extract factual business knowledge from website text.
-
-Extract EVERY useful fact actually present in the text.
-
-Rules:
-- Never invent facts.
-- Never guess.
-- Use meaningful lowercase snake_case field names.
-- Do not use section_1, section_2, text_1, unknown, data_1.
-- Extract names, services, products, prices, policies, hours, locations, staff, doctors, facilities, contact details, FAQs, qualifications, payment information, appointment information, company history, service areas and other useful business facts.
-- Preserve important details.
-- If a list exists, return an array.
-- If structured information exists, return an object.
-- Ignore navigation, cookie notices, tracking text, CSS, JavaScript and generic website boilerplate.
-- Only use information contained in the supplied text.
-- Return JSON only.
-`;
+  budget.websiteFetches++;
 
 
-  // ==========================================================
-  // USER PROMPT
-  // ==========================================================
+  const controller =
+    new AbortController();
 
-  const userPrompt = `
-URL:
-${input.url}
-
-PAGE TITLE:
-${input.title || ""}
-
-CHUNK:
-${input.chunkNumber}/${input.totalChunks}
-
-CONTENT:
-${input.chunk}
-
-Extract the factual business knowledge from this chunk.
-`;
+  const timeout =
+    setTimeout(
+      () => controller.abort(),
+      CONFIG.FETCH_TIMEOUT_MS
+    );
 
 
-  // ==========================================================
-  // STRUCTURED OUTPUT
-  //
-  // Keep schema simple.
-  // The previous anyOf-heavy schema can make structured
-  // extraction unnecessarily fragile.
-  //
-  // data is returned as JSON-compatible text.
-  // We parse it ourselves before saving to jsonb.
-  // ==========================================================
+  try {
 
-  const responseFormat = {
+    const response =
+      await fetch(
+        url,
+        {
+          method: "GET",
 
-    type:
-      "json_schema",
+          redirect: "follow",
 
-    json_schema: {
+          headers: {
 
-      name:
-        "business_knowledge",
+            "User-Agent":
+              CONFIG.USER_AGENT,
 
-      strict:
-        true,
+            "Accept":
+              "text/html,application/xhtml+xml"
+          },
 
-      description:
-        "Business facts extracted from website content.",
+          signal:
+            controller.signal
+        }
+      );
 
-      schema: {
 
-        type:
-          "object",
+    if (!response.ok) {
 
-        additionalProperties:
-          false,
-
-        properties: {
-
-          fields: {
-
-            type:
-              "array",
-
-            items: {
-
-              type:
-                "object",
-
-              additionalProperties:
-                false,
-
-              properties: {
-
-                field: {
-                  type:
-                    "string"
-                },
-
-                data: {
-                  type:
-                    "string"
-                }
-
-              },
-
-              required: [
-                "field",
-                "data"
-              ]
-
-            }
-
-          }
-
-        },
-
-        required: [
-          "fields"
-        ]
-
-      }
-
+      throw new Error(
+        `Website returned HTTP ${response.status}`
+      );
     }
 
+
+    const contentType =
+      response.headers.get(
+        "content-type"
+      ) || "";
+
+
+    // --------------------------------------------------------
+    // ONLY HTML
+    // --------------------------------------------------------
+
+    if (
+      !contentType.includes("text/html") &&
+      !contentType.includes("application/xhtml+xml")
+    ) {
+
+      throw new Error(
+        `Not an HTML page: ${contentType}`
+      );
+    }
+
+
+    // --------------------------------------------------------
+    // SIZE CHECK
+    // --------------------------------------------------------
+
+    const contentLength =
+      Number(
+        response.headers.get(
+          "content-length"
+        ) || 0
+      );
+
+
+    if (
+      contentLength >
+      CONFIG.MAX_HTML_BYTES
+    ) {
+
+      throw new Error(
+        "HTML page is too large."
+      );
+    }
+
+
+    const text =
+      await response.text();
+
+
+    if (
+      text.length >
+      CONFIG.MAX_HTML_BYTES
+    ) {
+
+      throw new Error(
+        "HTML page exceeded maximum size."
+      );
+    }
+
+
+    return text;
+
+  } finally {
+
+    clearTimeout(timeout);
+  }
+}
+
+
+// ============================================================
+// EXTRACT READABLE CONTENT
+// ============================================================
+
+function extractReadableContent(
+  html,
+  url
+) {
+
+  // ----------------------------------------------------------
+  // TITLE
+  // ----------------------------------------------------------
+
+  const title =
+    matchTag(
+      html,
+      "title"
+    );
+
+
+  // ----------------------------------------------------------
+  // REMOVE UNNECESSARY HTML
+  // ----------------------------------------------------------
+
+  let cleaned =
+    html
+
+      // Remove comments
+      .replace(
+        /<!--[\s\S]*?-->/g,
+        " "
+      )
+
+      // Remove script
+      .replace(
+        /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+        " "
+      )
+
+      // Remove style
+      .replace(
+        /<style\b[^>]*>[\s\S]*?<\/style>/gi,
+        " "
+      )
+
+      // Remove noscript
+      .replace(
+        /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
+        " "
+      )
+
+      // Remove SVG
+      .replace(
+        /<svg\b[^>]*>[\s\S]*?<\/svg>/gi,
+        " "
+      )
+
+      // Remove canvas
+      .replace(
+        /<canvas\b[^>]*>[\s\S]*?<\/canvas>/gi,
+        " "
+      )
+
+      // Remove iframe
+      .replace(
+        /<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi,
+        " "
+      )
+
+      // Remove navigation
+      .replace(
+        /<nav\b[^>]*>[\s\S]*?<\/nav>/gi,
+        " "
+      )
+
+      // Remove footer
+      .replace(
+        /<footer\b[^>]*>[\s\S]*?<\/footer>/gi,
+        " "
+      )
+
+      // Remove aside
+      .replace(
+        /<aside\b[^>]*>[\s\S]*?<\/aside>/gi,
+        " "
+      )
+
+      // Remove head
+      .replace(
+        /<head\b[^>]*>[\s\S]*?<\/head>/gi,
+        " "
+      );
+
+
+  // ----------------------------------------------------------
+  // ADD LINE BREAKS FOR IMPORTANT HTML ELEMENTS
+  // ----------------------------------------------------------
+
+  cleaned =
+    cleaned
+
+      .replace(
+        /<\/(p|div|section|article|main|header|li|h1|h2|h3|h4|h5|h6|tr)>/gi,
+        "\n"
+      )
+
+      .replace(
+        /<(br|hr)\s*\/?>/gi,
+        "\n"
+      );
+
+
+  // ----------------------------------------------------------
+  // REMOVE HTML TAGS
+  // ----------------------------------------------------------
+
+  cleaned =
+    cleaned.replace(
+      /<[^>]+>/g,
+      " "
+    );
+
+
+  // ----------------------------------------------------------
+  // DECODE COMMON HTML ENTITIES
+  // ----------------------------------------------------------
+
+  cleaned =
+    decodeHtmlEntities(
+      cleaned
+    );
+
+
+  // ----------------------------------------------------------
+  // NORMALIZE WHITESPACE
+  // ----------------------------------------------------------
+
+  cleaned =
+    cleaned
+
+      .replace(
+        /\r/g,
+        ""
+      )
+
+      .replace(
+        /[ \t]+/g,
+        " "
+      )
+
+      .replace(
+        /\n\s*\n\s*\n+/g,
+        "\n\n"
+      )
+
+      .trim();
+
+
+  // ----------------------------------------------------------
+  // LIMIT EXTREMELY LONG REPEATED BOILERPLATE
+  // ----------------------------------------------------------
+
+  cleaned =
+    removeRepeatedLines(
+      cleaned
+    );
+
+
+  return {
+
+    url,
+
+    title:
+      cleanText(title),
+
+    text:
+      cleaned
   };
+}
 
 
-  // ==========================================================
-  // CALL SARVAM
-  // ==========================================================
+// ============================================================
+// SARVAM AI EXTRACTION
+// ============================================================
+
+async function extractWithSarvam(
+  page,
+  env,
+  budget
+) {
+
+  budget.aiCalls++;
+
+
+  const systemPrompt = `
+You are a website business-knowledge extraction engine.
+
+Your job is to extract useful factual information from the
+provided website text.
+
+The extracted information will be stored in a database and later
+used by AI employees such as:
+
+- AI receptionist
+- WhatsApp agent
+- customer support agent
+- sales agent
+- appointment agent
+- Gmail agent
+
+IMPORTANT RULES:
+
+1. Extract ONLY information explicitly present in the text.
+2. NEVER invent information.
+3. NEVER guess missing information.
+4. Do not infer facts that are not stated.
+5. Extract as much useful business information as possible.
+6. Use meaningful lowercase snake_case field names.
+7. Do not use useless field names such as:
+   - text
+   - section
+   - content
+   - data
+   - information
+   - unknown
+   - miscellaneous
+   - other
+8. Preserve exact facts, names, prices, phone numbers,
+   email addresses, addresses, URLs, service names and policies.
+9. Combine related information into useful structured values.
+10. If a value naturally contains multiple items, use an array.
+11. If a value contains structured information, use an object.
+12. Ignore website navigation.
+13. Ignore cookie banners.
+14. Ignore tracking information.
+15. Ignore CSS.
+16. Ignore JavaScript.
+17. Ignore repeated footer/navigation boilerplate.
+18. Do not create fields from empty or meaningless text.
+19. Do not create duplicate fields with different names when
+    they represent the same fact.
+20. Extract information useful for answering real customer
+    questions.
+
+IMPORTANT FIELD EXAMPLES:
+
+Good:
+
+business_name
+business_description
+services
+service_details
+service_prices
+opening_hours
+appointment_information
+phone_numbers
+email_addresses
+physical_address
+locations
+doctors
+dentists
+doctor_qualifications
+emergency_services
+payment_methods
+insurance_information
+cancellation_policy
+refund_policy
+contact_information
+whatsapp_number
+website
+social_media
+faq
+service_areas
+products
+product_prices
+facilities
+parking_information
+about_company
+company_history
+languages_supported
+
+Bad:
+
+text
+page_text
+section
+content
+unknown
+data
+misc
+random_information
+
+If multiple services are present, preserve ALL services.
+
+If multiple doctors are present, preserve ALL doctors.
+
+If multiple phone numbers are present, preserve ALL phone
+numbers.
+
+If multiple prices are present, preserve ALL prices.
+
+If the page contains useful information that does not fit the
+examples above, create a specific meaningful field name.
+
+Do not summarize away important details.
+
+Return JSON only.
+`;
+
+
+  const userPrompt = `
+WEBSITE URL:
+${page.url}
+
+PAGE TITLE:
+${page.title || "(no title)"}
+
+CHUNK:
+${page.chunkIndex + 1} of ${page.totalChunks}
+
+WEBSITE CONTENT:
+${page.chunk}
+
+Extract every useful factual business fact from this content.
+`;
+
 
   const response =
-    await fetchWithTimeout(
-      CONFIG.SARVAM_URL,
+    await fetch(
+      "https://api.sarvam.ai/v1/chat/completions",
       {
 
-        method:
-          "POST",
+        method: "POST",
 
         headers: {
 
@@ -940,7 +1339,6 @@ Extract the factual business knowledge from this chunk.
 
           "api-subscription-key":
             env.SARVAM_API_KEY
-
         },
 
         body:
@@ -952,354 +1350,527 @@ Extract the factual business knowledge from this chunk.
             messages: [
 
               {
-                role:
-                  "system",
-
-                content:
-                  systemPrompt
+                role: "system",
+                content: systemPrompt
               },
 
               {
-                role:
-                  "user",
-
-                content:
-                  userPrompt
+                role: "user",
+                content: userPrompt
               }
 
             ],
 
-            // ------------------------------------------------
-            // Structured JSON
-            // ------------------------------------------------
-
-            response_format:
-              responseFormat,
-
-            // ------------------------------------------------
-            // Very low randomness
-            // ------------------------------------------------
-
-            temperature:
-              0.1,
-
-            // ------------------------------------------------
-            // IMPORTANT:
-            //
-            // Disable reasoning.
-            //
-            // This is an extraction task, not a reasoning task.
-            // ------------------------------------------------
+            temperature: 0.1,
 
             reasoning_effort:
-              null,
+              CONFIG.REASONING_EFFORT,
 
-            // ------------------------------------------------
-            // Give enough room for many extracted facts.
-            // ------------------------------------------------
+            max_tokens: 4096,
 
-            max_tokens:
-              4096
+            response_format: {
 
+              type: "json_schema",
+
+              json_schema: {
+
+                name:
+                  "business_information",
+
+                strict: true,
+
+                schema: {
+
+                  type: "object",
+
+                  additionalProperties: false,
+
+                  properties: {
+
+                    fields: {
+
+                      type: "array",
+
+                      items: {
+
+                        type: "object",
+
+                        additionalProperties: false,
+
+                        properties: {
+
+                          field: {
+                            type: "string"
+                          },
+
+                          data: {
+
+                            anyOf: [
+
+                              {
+                                type: "string"
+                              },
+
+                              {
+                                type: "number"
+                              },
+
+                              {
+                                type: "boolean"
+                              },
+
+                              {
+                                type: "array",
+                                items: {}
+                              },
+
+                              {
+                                type: "object",
+                                additionalProperties: true
+                              }
+                            ]
+                          }
+
+                        },
+
+                        required: [
+                          "field",
+                          "data"
+                        ]
+                      }
+                    }
+
+                  },
+
+                  required: [
+                    "fields"
+                  ]
+                }
+              }
+            }
           })
-
-      },
-
-      CONFIG.SARVAM_TIMEOUT
+      }
     );
 
 
-  // ==========================================================
-  // READ RESPONSE
-  // ==========================================================
-
-  const raw =
-    await response.text();
-
+  // ----------------------------------------------------------
+  // HANDLE SARVAM ERROR
+  // ----------------------------------------------------------
 
   if (!response.ok) {
 
-    throw new Error(
-      `Sarvam HTTP ${response.status}: ${raw.slice(
-        0,
-        1500
-      )}`
-    );
+    const errorText =
+      await safeReadText(
+        response
+      );
 
+    throw new Error(
+      `Sarvam HTTP ${response.status}: ${errorText}`
+    );
   }
 
 
-  let apiResponse;
+  // ----------------------------------------------------------
+  // PARSE RESPONSE
+  // ----------------------------------------------------------
 
-  try {
+  const json =
+    await response.json();
 
-    apiResponse =
-      JSON.parse(raw);
-
-  } catch {
-
-    throw new Error(
-      "Sarvam returned invalid JSON."
-    );
-
-  }
-
-
-  // ==========================================================
-  // GET MODEL CONTENT
-  // ==========================================================
 
   const content =
-    apiResponse
-      ?.choices?.[0]
-      ?.message
-      ?.content;
+    json?.choices?.[0]?.message?.content;
 
 
   if (!content) {
 
     throw new Error(
-      "Sarvam returned empty content."
+      "Sarvam returned no message content."
     );
-
   }
 
 
-  // ==========================================================
-  // PARSE MODEL JSON
-  // ==========================================================
+  // ----------------------------------------------------------
+  // CONTENT MAY BE STRING
+  // ----------------------------------------------------------
 
-  let result;
-
-  try {
-
-    result =
-      typeof content === "string"
-        ? JSON.parse(content)
-        : content;
-
-  } catch {
-
-    throw new Error(
-      "Sarvam output could not be parsed as JSON."
-    );
-
-  }
-
-
-  return result;
-
-}
-
-
-// ============================================================
-// NORMALIZE FIELDS
-// ============================================================
-
-function normalizeFields(
-  fields
-) {
+  let parsed;
 
   if (
-    !Array.isArray(fields)
+    typeof content === "string"
   ) {
-
-    return [];
-
-  }
-
-
-  const results = [];
-
-
-  for (
-    const item of fields
-  ) {
-
-    if (!item) {
-      continue;
-    }
-
-
-    // --------------------------------------------------------
-    // FIELD NAME
-    // --------------------------------------------------------
-
-    let field =
-      String(
-        item.field || ""
-      )
-        .trim()
-        .toLowerCase();
-
-
-    if (!field) {
-      continue;
-    }
-
-
-    field =
-      field
-        .replace(
-          /[\s-]+/g,
-          "_"
-        )
-        .replace(
-          /[^a-z0-9_]/g,
-          ""
-        )
-        .replace(
-          /_+/g,
-          "_"
-        )
-        .replace(
-          /^_+|_+$/g,
-          ""
-        );
-
-
-    if (!field) {
-      continue;
-    }
-
-
-    // --------------------------------------------------------
-    // Reject useless names
-    // --------------------------------------------------------
-
-    const forbidden =
-      new Set([
-
-        "section",
-        "section_1",
-        "section_2",
-
-        "text",
-        "text_1",
-        "text_2",
-
-        "data",
-        "data_1",
-        "data_2",
-
-        "unknown",
-        "information",
-
-        "content"
-
-      ]);
-
-
-    if (
-      forbidden.has(field)
-    ) {
-
-      continue;
-
-    }
-
-
-    // --------------------------------------------------------
-    // DATA
-    // --------------------------------------------------------
-
-    let data =
-      item.data;
-
-
-    if (
-      typeof data !==
-      "string"
-    ) {
-
-      data =
-        JSON.stringify(
-          data
-        );
-
-    }
-
-
-    data =
-      data.trim();
-
-
-    if (!data) {
-      continue;
-    }
-
-
-    // --------------------------------------------------------
-    // Convert AI's JSON string back into JSONB
-    //
-    // Example:
-    //
-    // "[\"Dental implants\",\"Root canal\"]"
-    //
-    // becomes a real JSON array.
-    // --------------------------------------------------------
-
-    let parsedData;
-
 
     try {
 
-      parsedData =
+      parsed =
         JSON.parse(
-          data
+          content
         );
 
     } catch {
 
-      // Normal text
-      parsedData =
-        data;
+      // Sometimes a model can return JSON surrounded by
+      // accidental markdown. Try extracting the object.
 
+      parsed =
+        parseJsonObject(
+          content
+        );
     }
 
+  } else {
 
-    results.push({
-
-      field,
-
-      data:
-        parsedData
-
-    });
-
+    parsed = content;
   }
 
 
-  return results;
+  // ----------------------------------------------------------
+  // VALIDATE
+  // ----------------------------------------------------------
 
+  if (
+    !parsed ||
+    !Array.isArray(
+      parsed.fields
+    )
+  ) {
+
+    throw new Error(
+      "Sarvam returned invalid structured data."
+    );
+  }
+
+
+  return parsed.fields;
 }
 
 
 // ============================================================
-// SAVE TO SUPABASE
+// NORMALIZE AI FIELD
 // ============================================================
 
-async function saveBusinessData(
-  env,
-  applicationId,
-  field,
-  data,
-  sourceUrl
+function normalizeField(
+  item
 ) {
 
+  if (
+    !item ||
+    typeof item !== "object"
+  ) {
+    return null;
+  }
 
-  const endpoint =
-    `${env.SUPABASE_URL}/rest/v1/business_data` +
-    `?on_conflict=application_id,source_url,field`;
+
+  // ----------------------------------------------------------
+  // FIELD NAME
+  // ----------------------------------------------------------
+
+  let field =
+    String(
+      item.field || ""
+    )
+      .trim()
+      .toLowerCase();
+
+
+  // ----------------------------------------------------------
+  // NORMALIZE FIELD NAME
+  // ----------------------------------------------------------
+
+  field =
+    field
+
+      .replace(
+        /[^\p{L}\p{N}]+/gu,
+        "_"
+      )
+
+      .replace(
+        /^_+|_+$/g,
+        ""
+      )
+
+      .replace(
+        /_+/g,
+        "_"
+      );
+
+
+  // ----------------------------------------------------------
+  // VALIDATE FIELD NAME
+  // ----------------------------------------------------------
+
+  if (
+    !field ||
+    field.length < 2
+  ) {
+    return null;
+  }
+
+
+  const forbidden =
+    new Set([
+
+      "text",
+      "page_text",
+      "section",
+      "content",
+      "data",
+      "information",
+      "unknown",
+      "misc",
+      "miscellaneous",
+      "other",
+      "random",
+      "details"
+    ]);
+
+
+  if (
+    forbidden.has(field)
+  ) {
+    return null;
+  }
+
+
+  // ----------------------------------------------------------
+  // DATA
+  // ----------------------------------------------------------
+
+  let data =
+    item.data;
+
+
+  if (
+    data === null ||
+    data === undefined
+  ) {
+    return null;
+  }
+
+
+  // ----------------------------------------------------------
+  // REMOVE EMPTY STRINGS
+  // ----------------------------------------------------------
+
+  if (
+    typeof data === "string"
+  ) {
+
+    data =
+      data.trim();
+
+    if (!data) {
+      return null;
+    }
+  }
+
+
+  return {
+
+    field,
+
+    data
+  };
+}
+
+
+// ============================================================
+// MERGE VALUES FROM MULTIPLE AI CHUNKS
+// ============================================================
+
+function mergeValues(
+  oldValue,
+  newValue
+) {
+
+  // ----------------------------------------------------------
+  // BOTH ARRAYS
+  // ----------------------------------------------------------
+
+  if (
+    Array.isArray(oldValue) &&
+    Array.isArray(newValue)
+  ) {
+
+    return uniqueArray(
+      [
+        ...oldValue,
+        ...newValue
+      ]
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // OLD ARRAY
+  // ----------------------------------------------------------
+
+  if (
+    Array.isArray(oldValue)
+  ) {
+
+    return uniqueArray(
+      [
+        ...oldValue,
+        newValue
+      ]
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // NEW ARRAY
+  // ----------------------------------------------------------
+
+  if (
+    Array.isArray(newValue)
+  ) {
+
+    return uniqueArray(
+      [
+        oldValue,
+        ...newValue
+      ]
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // BOTH OBJECTS
+  // ----------------------------------------------------------
+
+  if (
+    isPlainObject(oldValue) &&
+    isPlainObject(newValue)
+  ) {
+
+    return deepMergeObjects(
+      oldValue,
+      newValue
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // SAME VALUE
+  // ----------------------------------------------------------
+
+  if (
+    JSON.stringify(oldValue) ===
+    JSON.stringify(newValue)
+  ) {
+
+    return oldValue;
+  }
+
+
+  // ----------------------------------------------------------
+  // DIFFERENT VALUES
+  // ----------------------------------------------------------
+
+  // Do NOT overwrite useful information.
+  //
+  // Example:
+  //
+  // chunk 1:
+  // service_price = "₹500"
+  //
+  // chunk 2:
+  // service_price = "₹1,000"
+  //
+  // Preserve both.
+
+  return uniqueArray([
+    oldValue,
+    newValue
+  ]);
+}
+
+
+// ============================================================
+// DEEP MERGE OBJECTS
+// ============================================================
+
+function deepMergeObjects(
+  a,
+  b
+) {
+
+  const result = {
+    ...a
+  };
+
+
+  for (
+    const [key, value] of
+    Object.entries(b)
+  ) {
+
+    if (
+      result[key] === undefined
+    ) {
+
+      result[key] = value;
+
+      continue;
+    }
+
+
+    result[key] =
+      mergeValues(
+        result[key],
+        value
+      );
+  }
+
+
+  return result;
+}
+
+
+// ============================================================
+// BULK SAVE TO SUPABASE
+// ============================================================
+
+async function bulkSaveToSupabase(
+  rows,
+  env,
+  budget
+) {
+
+  if (
+    !Array.isArray(rows) ||
+    rows.length === 0
+  ) {
+
+    return {
+      saved: 0,
+      failed: 0
+    };
+  }
+
+
+  // ----------------------------------------------------------
+  // ONE SUPABASE REQUEST
+  // ----------------------------------------------------------
+
+  budget.supabaseWrites++;
+
+
+  const url =
+    `${env.SUPABASE_URL}/rest/v1/${CONFIG.SUPABASE_TABLE}` +
+    `?on_conflict=${encodeURIComponent(
+      "application_id,source_url,field"
+    )}`;
 
 
   const response =
     await fetch(
-      endpoint,
+      url,
       {
 
-        method:
-          "POST",
+        method: "POST",
 
         headers: {
 
@@ -1314,333 +1885,244 @@ async function saveBusinessData(
 
           "Prefer":
             "resolution=merge-duplicates,return=minimal"
-
         },
 
         body:
-          JSON.stringify({
-
-            application_id:
-              applicationId,
-
-            field,
-
-            data,
-
-            source_url:
-              sourceUrl,
-
-            updated_at:
-              new Date().toISOString()
-
-          })
-
+          JSON.stringify(
+            rows
+          )
       }
     );
 
 
   if (!response.ok) {
 
-    const error =
-      await response.text();
+    const errorText =
+      await safeReadText(
+        response
+      );
 
 
     throw new Error(
-      `Supabase error ${response.status}: ${error}`
+      `Supabase bulk upsert failed: HTTP ${response.status} ${errorText}`
     );
-
   }
 
+
+  return {
+
+    saved:
+      rows.length,
+
+    failed:
+      0
+  };
 }
 
 
 // ============================================================
-// VERIFY APPLICATION
+// DISCOVER WEBSITE URLS
 // ============================================================
 
-async function getApplication(
-  env,
-  applicationId
+async function discoverWebsiteUrls(
+  website,
+  budget
 ) {
-
-
-  const endpoint =
-    `${env.SUPABASE_URL}/rest/v1/applications` +
-    `?id=eq.${encodeURIComponent(
-      applicationId
-    )}` +
-    `&select=id,user_id,name` +
-    `&limit=1`;
-
-
-  const response =
-    await fetch(
-      endpoint,
-      {
-
-        headers: {
-
-          "apikey":
-            env.SUPABASE_SECRET_KEY,
-
-          "Authorization":
-            `Bearer ${env.SUPABASE_SECRET_KEY}`
-
-        }
-
-      }
-    );
-
-
-  if (!response.ok) {
-
-    throw new Error(
-      `Application lookup failed: ${response.status}`
-    );
-
-  }
-
-
-  const rows =
-    await response.json();
-
-
-  return rows?.[0] || null;
-
-}
-
-
-// ============================================================
-// PAGE DISCOVERY
-// ============================================================
-
-async function discoverPages(
-  websiteUrl
-) {
-
-
-  const origin =
-    new URL(
-      websiteUrl
-    ).origin;
-
-
-  const hostname =
-    new URL(
-      websiteUrl
-    ).hostname;
-
 
   const urls =
     new Set();
 
 
   // ----------------------------------------------------------
-  // Homepage
+  // ALWAYS INCLUDE HOMEPAGE
   // ----------------------------------------------------------
 
   urls.add(
     normalizeUrl(
-      websiteUrl
+      website
     )
   );
 
 
   // ----------------------------------------------------------
-  // Sitemap candidates
+  // ORIGIN
   // ----------------------------------------------------------
 
-  const sitemapQueue =
-    new Set([
-
-      `${origin}/sitemap.xml`,
-
-      `${origin}/sitemap_index.xml`
-
-    ]);
+  const origin =
+    new URL(
+      website
+    ).origin;
 
 
   // ----------------------------------------------------------
-  // robots.txt
+  // SITEMAP URLS
   // ----------------------------------------------------------
 
-  try {
+  const sitemapCandidates = [
 
-    const robots =
-      await fetchWithTimeout(
-        `${origin}/robots.txt`,
-        {
-          headers: {
-            "User-Agent":
-              "ReportliAI-KnowledgeBot/1.0"
-          }
-        },
-        CONFIG.WEBSITE_TIMEOUT
-      );
+    `${origin}/sitemap.xml`,
+
+    `${origin}/sitemap_index.xml`,
+
+    `${origin}/wp-sitemap.xml`
+  ];
 
 
-    if (robots.ok) {
+  // ----------------------------------------------------------
+  // ROBOTS.TXT
+  // ----------------------------------------------------------
 
-      const text =
-        await robots.text();
+  if (
+    budget.discoveryRequests <
+    CONFIG.MAX_SITEMAPS
+  ) {
+
+    try {
+
+      const robotsUrl =
+        `${origin}/robots.txt`;
 
 
-      const matches =
-        text.match(
-          /Sitemap:\s*(.+)/gi
+      budget.discoveryRequests++;
+
+
+      const robots =
+        await fetchTextForDiscovery(
+          robotsUrl
         );
 
 
-      if (matches) {
+      if (robots) {
 
-        for (
-          const line of matches
-        ) {
-
-          const sitemap =
-            line
-              .replace(
-                /Sitemap:\s*/i,
-                ""
-              )
-              .trim();
+        const robotSitemaps =
+          extractSitemapsFromRobots(
+            robots
+          );
 
 
-          if (
-            isSafeUrl(
-              sitemap
-            )
-          ) {
-
-            sitemapQueue.add(
-              sitemap
-            );
-
-          }
-
-        }
-
+        sitemapCandidates.push(
+          ...robotSitemaps
+        );
       }
 
+    } catch {
+      // Ignore robots.txt errors.
     }
-
-  } catch {
-
-    // robots is optional
-
   }
 
 
   // ----------------------------------------------------------
-  // Process sitemaps
+  // FETCH SITEMAPS
   // ----------------------------------------------------------
 
-  const processed =
+  const sitemapQueue =
+    uniqueUrls(
+      sitemapCandidates
+    );
+
+
+  const visitedSitemaps =
     new Set();
 
 
+  let sitemapCount = 0;
+
+
   while (
-
-    sitemapQueue.size > 0 &&
-
-    processed.size <
-      CONFIG.MAX_SITEMAPS
-
+    sitemapQueue.length > 0 &&
+    sitemapCount <
+      CONFIG.MAX_SITEMAPS &&
+    urls.size <
+      CONFIG.MAX_DISCOVERED_URLS
   ) {
 
-
     const sitemapUrl =
-      sitemapQueue.values()
-        .next()
-        .value;
+      sitemapQueue.shift();
 
 
-    sitemapQueue.delete(
-      sitemapUrl
-    );
+    const normalizedSitemap =
+      normalizeUrl(
+        sitemapUrl
+      );
 
 
     if (
-      processed.has(
-        sitemapUrl
+      visitedSitemaps.has(
+        normalizedSitemap
       )
     ) {
-
       continue;
-
     }
 
 
-    processed.add(
-      sitemapUrl
+    visitedSitemaps.add(
+      normalizedSitemap
     );
+
+
+    sitemapCount++;
+
+
+    if (
+      budget.discoveryRequests >=
+      CONFIG.MAX_SITEMAPS + 1
+    ) {
+      break;
+    }
 
 
     try {
 
-      const response =
-        await fetchWithTimeout(
-          sitemapUrl,
-          {
-            headers: {
-              "User-Agent":
-                "ReportliAI-KnowledgeBot/1.0"
-            }
-          },
-          CONFIG.WEBSITE_TIMEOUT
+      budget.discoveryRequests++;
+
+
+      const sitemapText =
+        await fetchTextForDiscovery(
+          normalizedSitemap
         );
 
 
-      if (!response.ok) {
+      if (!sitemapText) {
         continue;
       }
 
 
-      const xml =
-        await readLimitedText(
-          response,
-          2_000_000
-        );
-
-
       // ------------------------------------------------------
-      // Sitemap indexes
+      // SITEMAP INDEX
       // ------------------------------------------------------
 
-      const childSitemaps =
-        extractXmlLocs(
-          xml,
-          "sitemap"
+      const nestedSitemaps =
+        extractSitemapUrls(
+          sitemapText
         );
 
 
       for (
-        const child of childSitemaps
+        const nested of nestedSitemaps
       ) {
 
         if (
-          processed.size +
-            sitemapQueue.size <
-          CONFIG.MAX_SITEMAPS
+          !visitedSitemaps.has(
+            normalizeUrl(
+              nested
+            )
+          )
         ) {
 
-          sitemapQueue.add(
-            child
+          sitemapQueue.push(
+            nested
           );
-
         }
-
       }
 
 
       // ------------------------------------------------------
-      // Page URLs
+      // PAGE URLS
       // ------------------------------------------------------
 
       const pageUrls =
-        extractXmlLocs(
-          xml,
-          "url"
+        extractUrlsFromSitemap(
+          sitemapText
         );
 
 
@@ -1648,87 +2130,71 @@ async function discoverPages(
         const pageUrl of pageUrls
       ) {
 
+        const normalized =
+          normalizeUrl(
+            pageUrl
+          );
+
+
         if (
-          urls.size >=
-          CONFIG.MAX_DISCOVERED_URLS
+          isSameOrigin(
+            normalized,
+            origin
+          )
         ) {
 
-          break;
-
-        }
-
-
-        try {
-
-          const parsed =
-            new URL(
-              pageUrl
-            );
-
+          urls.add(
+            normalized
+          );
 
           if (
-            parsed.hostname ===
-            hostname
+            urls.size >=
+            CONFIG.MAX_DISCOVERED_URLS
           ) {
-
-            urls.add(
-              normalizeUrl(
-                pageUrl
-              )
-            );
-
+            break;
           }
-
-        } catch {
-
-          // ignore
-
         }
-
       }
 
     } catch {
-
-      // ignore broken sitemap
-
+      // Ignore individual sitemap failures.
     }
-
   }
 
 
   // ----------------------------------------------------------
-  // Also crawl homepage links
+  // HOMEPAGE INTERNAL LINKS
   // ----------------------------------------------------------
 
-  try {
+  // If sitemap discovery did not give enough URLs, fetch the
+  // homepage and collect internal links.
+  //
+  // This is intentionally done only once.
 
-    const response =
-      await fetchWithTimeout(
-        websiteUrl,
-        {
-          headers: {
-            "User-Agent":
-              "ReportliAI-KnowledgeBot/1.0"
-          }
-        },
-        CONFIG.WEBSITE_TIMEOUT
-      );
+  if (
+    urls.size <
+    Math.min(
+      50,
+      CONFIG.MAX_DISCOVERED_URLS
+    )
+  ) {
+
+    try {
+
+      budget.discoveryRequests++;
 
 
-    if (response.ok) {
-
-      const html =
-        await readLimitedText(
-          response,
-          CONFIG.MAX_HTML_BYTES
+      const homepageHtml =
+        await fetchHtml(
+          website,
+          budget
         );
 
 
       const links =
         extractInternalLinks(
-          html,
-          origin,
-          hostname
+          homepageHtml,
+          origin
         );
 
 
@@ -1736,108 +2202,198 @@ async function discoverPages(
         const link of links
       ) {
 
-        if (
-          urls.size >=
-          CONFIG.MAX_DISCOVERED_URLS
-        ) {
-
-          break;
-
-        }
-
-
         urls.add(
           link
         );
 
+
+        if (
+          urls.size >=
+          CONFIG.MAX_DISCOVERED_URLS
+        ) {
+          break;
+        }
       }
 
+    } catch {
+      // Homepage link discovery is optional.
     }
-
-  } catch {
-
-    // ignore
-
   }
 
 
-  return {
-
-    urls:
-      [...urls]
-
-  };
-
+  return Array.from(
+    urls
+  );
 }
 
 
 // ============================================================
-// EXTRACT XML LOCATIONS
+// DISCOVERY FETCH
 // ============================================================
 
-function extractXmlLocs(
-  xml,
-  type
+async function fetchTextForDiscovery(
+  url
 ) {
 
+  const controller =
+    new AbortController();
 
-  const results = [];
 
-
-  const regex =
-    new RegExp(
-      `<${type}[^>]*>[\\s\\S]*?<loc[^>]*>([\\s\\S]*?)<\\/loc>[\\s\\S]*?<\\/${type}>`,
-      "gi"
+  const timeout =
+    setTimeout(
+      () => controller.abort(),
+      8000
     );
 
 
-  let match;
+  try {
 
+    const response =
+      await fetch(
+        url,
+        {
 
-  while (
-    (match =
-      regex.exec(xml))
-  ) {
+          method: "GET",
 
-    const value =
-      decodeHtmlEntities(
-        match[1]
-          .trim()
+          redirect: "follow",
+
+          headers: {
+
+            "User-Agent":
+              CONFIG.USER_AGENT,
+
+            "Accept":
+              "application/xml,text/xml,text/plain"
+          },
+
+          signal:
+            controller.signal
+        }
       );
 
 
-    if (
-      isSafeUrl(
-        value
-      )
-    ) {
-
-      results.push(
-        value
-      );
-
+    if (!response.ok) {
+      return "";
     }
 
+
+    const text =
+      await response.text();
+
+
+    // Keep sitemap discovery small.
+    if (
+      text.length >
+      5 * 1024 * 1024
+    ) {
+
+      return text.slice(
+        0,
+        5 * 1024 * 1024
+      );
+    }
+
+
+    return text;
+
+  } finally {
+
+    clearTimeout(timeout);
   }
-
-
-  return results;
-
 }
 
 
 // ============================================================
-// EXTRACT INTERNAL LINKS
+// EXTRACT SITEMAP URLS
+// ============================================================
+
+function extractUrlsFromSitemap(
+  xml
+) {
+
+  const matches =
+    xml.match(
+      /<loc>\s*([^<]+)\s*<\/loc>/gi
+    ) || [];
+
+
+  return matches
+    .map(
+      item => {
+
+        const match =
+          item.match(
+            /<loc>\s*([^<]+)\s*<\/loc>/i
+          );
+
+        return match
+          ? decodeXmlEntities(
+              match[1].trim()
+            )
+          : null;
+      }
+    )
+    .filter(Boolean);
+}
+
+
+// ============================================================
+// EXTRACT NESTED SITEMAPS
+// ============================================================
+
+function extractSitemapUrls(
+  xml
+) {
+
+  return extractUrlsFromSitemap(
+    xml
+  )
+    .filter(
+      url =>
+        /\.xml($|\?)/i.test(
+          url
+        )
+    );
+}
+
+
+// ============================================================
+// ROBOTS SITEMAPS
+// ============================================================
+
+function extractSitemapsFromRobots(
+  robots
+) {
+
+  return robots
+    .split(/\r?\n/)
+    .map(
+      line => {
+
+        const match =
+          line.match(
+            /^\s*Sitemap:\s*(\S+)/i
+          );
+
+        return match
+          ? match[1].trim()
+          : null;
+      }
+    )
+    .filter(Boolean);
+}
+
+
+// ============================================================
+// INTERNAL LINKS
 // ============================================================
 
 function extractInternalLinks(
   html,
-  origin,
-  hostname
+  origin
 ) {
 
-
-  const links =
+  const results =
     new Set();
 
 
@@ -1849,34 +2405,21 @@ function extractInternalLinks(
 
 
   while (
-    (match =
-      regex.exec(html))
+    (match = regex.exec(html)) !== null
   ) {
 
-
-    let raw =
-      decodeHtmlEntities(
-        match[1]
-      )
-        .trim();
+    const raw =
+      match[1].trim();
 
 
     if (
       !raw ||
       raw.startsWith("#") ||
-      raw.startsWith(
-        "mailto:"
-      ) ||
-      raw.startsWith(
-        "tel:"
-      ) ||
-      raw.startsWith(
-        "javascript:"
-      )
+      raw.startsWith("mailto:") ||
+      raw.startsWith("tel:") ||
+      raw.startsWith("javascript:")
     ) {
-
       continue;
-
     }
 
 
@@ -1890,235 +2433,74 @@ function extractInternalLinks(
 
 
       if (
-        url.hostname !==
-        hostname
+        url.origin !== origin
       ) {
-
         continue;
-
       }
 
 
       url.hash = "";
 
 
-      links.add(
+      // Remove tracking parameters.
+      const trackingParams = [
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "fbclid",
+        "gclid"
+      ];
+
+
+      for (
+        const param of trackingParams
+      ) {
+
+        url.searchParams.delete(
+          param
+        );
+      }
+
+
+      results.add(
         normalizeUrl(
           url.toString()
         )
       );
 
-
     } catch {
-
-      // ignore
-
+      // Ignore malformed URLs.
     }
-
   }
 
 
-  return [
-    ...links
-  ];
-
+  return Array.from(
+    results
+  );
 }
 
 
 // ============================================================
-// CLEAN HTML
+// SPLIT TEXT INTO CHUNKS
 // ============================================================
 
-function extractReadableContent(
-  html
-) {
-
-
-  // ----------------------------------------------------------
-  // Title
-  // ----------------------------------------------------------
-
-  const titleMatch =
-    html.match(
-      /<title\b[^>]*>([\s\S]*?)<\/title>/i
-    );
-
-
-  const title =
-    titleMatch
-      ? cleanText(
-          titleMatch[1]
-        )
-      : "";
-
-
-  // ----------------------------------------------------------
-  // Remove things AI doesn't need
-  // ----------------------------------------------------------
-
-  let content =
-    html
-
-      .replace(
-        /<script\b[^>]*>[\s\S]*?<\/script>/gi,
-        " "
-      )
-
-      .replace(
-        /<style\b[^>]*>[\s\S]*?<\/style>/gi,
-        " "
-      )
-
-      .replace(
-        /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
-        " "
-      )
-
-      .replace(
-        /<svg\b[^>]*>[\s\S]*?<\/svg>/gi,
-        " "
-      )
-
-      .replace(
-        /<canvas\b[^>]*>[\s\S]*?<\/canvas>/gi,
-        " "
-      )
-
-      .replace(
-        /<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi,
-        " "
-      )
-
-      .replace(
-        /<nav\b[^>]*>[\s\S]*?<\/nav>/gi,
-        " "
-      )
-
-      .replace(
-        /<footer\b[^>]*>[\s\S]*?<\/footer>/gi,
-        " "
-      )
-
-      .replace(
-        /<aside\b[^>]*>[\s\S]*?<\/aside>/gi,
-        " "
-      );
-
-
-  // ----------------------------------------------------------
-  // Preserve block boundaries
-  // ----------------------------------------------------------
-
-  content =
-    content.replace(
-      /<\/(p|div|section|article|main|li|h1|h2|h3|h4|h5|h6|tr|br)>/gi,
-      "\n"
-    );
-
-
-  // ----------------------------------------------------------
-  // Remove tags
-  // ----------------------------------------------------------
-
-  content =
-    content.replace(
-      /<[^>]+>/g,
-      " "
-    );
-
-
-  // ----------------------------------------------------------
-  // Decode entities
-  // ----------------------------------------------------------
-
-  content =
-    decodeHtmlEntities(
-      content
-    );
-
-
-  // ----------------------------------------------------------
-  // Normalize
-  // ----------------------------------------------------------
-
-  content =
-    content
-      .replace(
-        /\u00a0/g,
-        " "
-      )
-      .replace(
-        /[ \t]+/g,
-        " "
-      )
-      .replace(
-        /\n\s*\n+/g,
-        "\n\n"
-      )
-      .trim();
-
-
-  // ----------------------------------------------------------
-  // Remove blank lines
-  // ----------------------------------------------------------
-
-  content =
-    content
-      .split("\n")
-      .map(
-        line =>
-          line.trim()
-      )
-      .filter(
-        Boolean
-      )
-      .join("\n");
-
-
-  return {
-
-    title,
-
-    text:
-      content
-
-  };
-
-}
-
-
-// ============================================================
-// SMART CHUNKING
-//
-// This is one of the biggest changes.
-//
-// Instead of 30,000 characters,
-// use ~6,000-character chunks.
-//
-// We also overlap 500 characters so a fact that
-// crosses a boundary is less likely to be lost.
-// ============================================================
-
-function createChunks(
+function splitTextIntoChunks(
   text,
   chunkSize,
   overlap
 ) {
 
-
-  const chunks = [];
-
-
   if (
-    text.length <=
-    chunkSize
+    text.length <= chunkSize
   ) {
 
-    return [
-      text
-    ];
-
+    return [text];
   }
+
+
+  const chunks = [];
 
 
   let start = 0;
@@ -2128,45 +2510,49 @@ function createChunks(
     start < text.length
   ) {
 
-
     let end =
       Math.min(
-        start +
-          chunkSize,
+        start + chunkSize,
         text.length
       );
 
 
     // --------------------------------------------------------
-    // Prefer ending at paragraph boundary
+    // TRY TO END AT A NATURAL BOUNDARY
     // --------------------------------------------------------
 
     if (
-      end <
-      text.length
+      end < text.length
     ) {
 
-      const paragraphBreak =
+      const newline =
         text.lastIndexOf(
-          "\n\n",
+          "\n",
           end
         );
 
 
+      const sentence =
+        text.lastIndexOf(
+          ". ",
+          end
+        );
+
+
+      const boundary =
+        Math.max(
+          newline,
+          sentence
+        );
+
+
       if (
-        paragraphBreak >
-        start +
-          Math.floor(
-            chunkSize *
-              0.6
-          )
+        boundary > start + chunkSize * 0.7
       ) {
 
         end =
-          paragraphBreak;
-
+          boundary + 1;
       }
-
     }
 
 
@@ -2180,309 +2566,108 @@ function createChunks(
 
 
     if (chunk) {
-
       chunks.push(
         chunk
       );
-
     }
 
 
     if (
-      end >=
-      text.length
+      end >= text.length
     ) {
-
       break;
-
     }
 
 
-    // --------------------------------------------------------
-    // Overlap
-    // --------------------------------------------------------
-
     start =
       Math.max(
-        end -
-          overlap,
-        start + 1
+        0,
+        end - overlap
       );
-
   }
 
 
   return chunks;
-
 }
 
 
 // ============================================================
-// READ RESPONSE WITH SIZE LIMIT
+// URL HELPERS
 // ============================================================
 
-async function readLimitedText(
-  response,
-  maxBytes
+function normalizeWebsite(
+  value
 ) {
 
-
-  if (!response.body) {
-
-    const text =
-      await response.text();
-
-
-    if (
-      new TextEncoder()
-        .encode(text)
-        .length >
-      maxBytes
-    ) {
-
-      throw new Error(
-        "Response too large."
-      );
-
-    }
-
-
-    return text;
-
-  }
-
-
-  const reader =
-    response.body.getReader();
-
-
-  const decoder =
-    new TextDecoder();
-
-
-  let result =
-    "";
-
-  let total =
-    0;
-
-
-  while (true) {
-
-    const {
-      done,
-      value
-    } =
-      await reader.read();
-
-
-    if (done) {
-      break;
-    }
-
-
-    total +=
-      value.byteLength;
-
-
-    if (
-      total >
-      maxBytes
-    ) {
-
-      try {
-        await reader.cancel();
-      } catch {}
-
-
-      throw new Error(
-        "Response exceeded size limit."
-      );
-
-    }
-
-
-    result +=
-      decoder.decode(
-        value,
-        {
-          stream:
-            true
-        }
-      );
-
-  }
-
-
-  result +=
-    decoder.decode();
-
-
-  return result;
-
-}
-
-
-// ============================================================
-// FETCH WITH TIMEOUT
-// ============================================================
-
-async function fetchWithTimeout(
-  url,
-  options = {},
-  timeoutMs
-) {
-
-
-  const controller =
-    new AbortController();
-
-
-  const timer =
-    setTimeout(
-      () =>
-        controller.abort(),
-      timeoutMs
-    );
-
-
-  try {
-
-    return await fetch(
-      url,
-      {
-        ...options,
-
-        signal:
-          controller.signal
-      }
-    );
-
-  } catch (error) {
-
-    if (
-      error.name ===
-      "AbortError"
-    ) {
-
-      throw new Error(
-        `Request timed out: ${url}`
-      );
-
-    }
-
-
-    throw error;
-
-  } finally {
-
-    clearTimeout(
-      timer
-    );
-
-  }
-
-}
-
-
-// ============================================================
-// URL NORMALIZATION
-// ============================================================
-
-function normalizeWebsiteUrl(
-  input
-) {
-
-
-  let value =
-    String(
-      input
-    ).trim();
+  let input =
+    value.trim();
 
 
   if (
     !/^https?:\/\//i.test(
-      value
+      input
     )
   ) {
 
-    value =
+    input =
       "https://" +
-      value;
-
+      input;
   }
 
 
   const url =
     new URL(
-      value
+      input
     );
 
 
-  url.hash =
-    "";
+  url.hash = "";
 
 
   return normalizeUrl(
     url.toString()
   );
-
 }
 
 
-// ============================================================
-// NORMALIZE URL
-// ============================================================
-
 function normalizeUrl(
-  input
+  value
 ) {
-
 
   const url =
     new URL(
-      input
+      value
     );
 
 
-  url.hash =
-    "";
+  url.hash = "";
 
 
-  const removeParams = [
+  // Remove common tracking parameters.
+  const trackingParams = [
 
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
     "fbclid",
     "gclid",
-    "mc_cid",
-    "mc_eid"
-
+    "ref"
   ];
 
 
   for (
-    const key of [
-      ...url.searchParams.keys()
-    ]
+    const param of trackingParams
   ) {
 
-    if (
-      key.startsWith(
-        "utm_"
-      ) ||
-      removeParams.includes(
-        key
-      )
-    ) {
-
-      url.searchParams.delete(
-        key
-      );
-
-    }
-
+    url.searchParams.delete(
+      param
+    );
   }
 
 
+  // Remove trailing slash except root.
   let result =
     url.toString();
 
@@ -2497,84 +2682,127 @@ function normalizeUrl(
         0,
         -1
       );
-
   }
 
 
   return result;
-
 }
 
 
-// ============================================================
-// SAFE URL
-// ============================================================
-
-function isSafeUrl(
-  input
+function isSameOrigin(
+  url,
+  origin
 ) {
 
   try {
 
-    const url =
-      new URL(
-        input
-      );
-
-
     return (
-      url.protocol ===
-        "http:" ||
-      url.protocol ===
-        "https:"
+      new URL(url).origin ===
+      origin
     );
 
   } catch {
 
     return false;
+  }
+}
 
+
+function uniqueUrls(
+  urls
+) {
+
+  const seen =
+    new Set();
+
+
+  const result = [];
+
+
+  for (
+    const url of urls
+  ) {
+
+    try {
+
+      const normalized =
+        normalizeUrl(
+          url
+        );
+
+
+      if (
+        !seen.has(
+          normalized
+        )
+      ) {
+
+        seen.add(
+          normalized
+        );
+
+        result.push(
+          normalized
+        );
+      }
+
+    } catch {
+      // Ignore invalid URLs.
+    }
   }
 
+
+  return result;
 }
 
 
 // ============================================================
-// CLEAN TEXT
+// HTML HELPERS
 // ============================================================
 
-function cleanText(
-  value
+function matchTag(
+  html,
+  tag
 ) {
+
+  const regex =
+    new RegExp(
+      `<${tag}[^>]*>([\\\\s\\\\S]*?)<\\\\/${tag}>`,
+      "i"
+    );
+
+
+  const match =
+    html.match(
+      regex
+    );
+
+
+  if (!match) {
+    return "";
+  }
+
 
   return decodeHtmlEntities(
-    String(
-      value
+    match[1]
+  )
+    .replace(
+      /<[^>]+>/g,
+      " "
     )
-      .replace(
-        /<[^>]+>/g,
-        " "
-      )
-      .replace(
-        /\s+/g,
-        " "
-      )
-      .trim()
-  );
-
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
 }
 
 
-// ============================================================
-// HTML ENTITY DECODER
-// ============================================================
-
 function decodeHtmlEntities(
-  value
+  text
 ) {
 
-  return String(
-    value
-  )
+  return text
 
     .replace(
       /&nbsp;/gi,
@@ -2604,29 +2832,259 @@ function decodeHtmlEntities(
     .replace(
       /&gt;/gi,
       ">"
-    )
+    );
+}
 
-    .replace(
-      /&#(\d+);/g,
-      (_, code) =>
-        String.fromCharCode(
-          Number(
-            code
-          )
-        )
-    )
 
-    .replace(
-      /&#x([0-9a-f]+);/gi,
-      (_, code) =>
-        String.fromCharCode(
-          parseInt(
-            code,
-            16
+function decodeXmlEntities(
+  text
+) {
+
+  return decodeHtmlEntities(
+    text
+  );
+}
+
+
+// ============================================================
+// REMOVE REPEATED LINES
+// ============================================================
+
+function removeRepeatedLines(
+  text
+) {
+
+  const lines =
+    text
+      .split(/\n+/)
+      .map(
+        line => line.trim()
+      )
+      .filter(Boolean);
+
+
+  const counts =
+    new Map();
+
+
+  for (
+    const line of lines
+  ) {
+
+    if (
+      line.length < 3
+    ) {
+      continue;
+    }
+
+
+    counts.set(
+      line,
+      (counts.get(line) || 0) + 1
+    );
+  }
+
+
+  return lines
+    .filter(
+      line => {
+
+        const count =
+          counts.get(
+            line
+          ) || 0;
+
+
+        // Remove lines repeated many times,
+        // which are usually navigation/boilerplate.
+        if (
+          count >= 5 &&
+          line.length < 200
+        ) {
+          return false;
+        }
+
+
+        return true;
+      }
+    )
+    .join("\n");
+}
+
+
+// ============================================================
+// ARRAY HELPERS
+// ============================================================
+
+function uniqueArray(
+  values
+) {
+
+  const result = [];
+
+
+  for (
+    const value of values
+  ) {
+
+    const exists =
+      result.some(
+        existing =>
+          JSON.stringify(
+            existing
+          ) ===
+          JSON.stringify(
+            value
           )
-        )
+      );
+
+
+    if (!exists) {
+
+      result.push(
+        value
+      );
+    }
+  }
+
+
+  return result;
+}
+
+
+// ============================================================
+// OBJECT HELPERS
+// ============================================================
+
+function isPlainObject(
+  value
+) {
+
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  );
+}
+
+
+// ============================================================
+// JSON PARSING
+// ============================================================
+
+function parseJsonObject(
+  text
+) {
+
+  const cleaned =
+    text
+      .replace(
+        /^```json\s*/i,
+        ""
+      )
+      .replace(
+        /^```\s*/i,
+        ""
+      )
+      .replace(
+        /\s*```$/i,
+        ""
+      )
+      .trim();
+
+
+  try {
+
+    return JSON.parse(
+      cleaned
     );
 
+  } catch {
+    // Continue.
+  }
+
+
+  const firstBrace =
+    cleaned.indexOf(
+      "{"
+    );
+
+
+  const lastBrace =
+    cleaned.lastIndexOf(
+      "}"
+    );
+
+
+  if (
+    firstBrace >= 0 &&
+    lastBrace > firstBrace
+  ) {
+
+    const objectText =
+      cleaned.slice(
+        firstBrace,
+        lastBrace + 1
+      );
+
+
+    return JSON.parse(
+      objectText
+    );
+  }
+
+
+  throw new Error(
+    "Could not parse Sarvam JSON."
+  );
+}
+
+
+// ============================================================
+// SAFE ERROR
+// ============================================================
+
+function safeError(
+  error
+) {
+
+  if (
+    error instanceof Error
+  ) {
+
+    return error.message;
+  }
+
+
+  return String(
+    error
+  );
+}
+
+
+// ============================================================
+// SAFE RESPONSE TEXT
+// ============================================================
+
+async function safeReadText(
+  response
+) {
+
+  try {
+
+    const text =
+      await response.text();
+
+
+    return text.slice(
+      0,
+      2000
+    );
+
+  } catch {
+
+    return "";
+  }
 }
 
 
@@ -2640,30 +3098,24 @@ function jsonResponse(
 ) {
 
   return new Response(
-
     JSON.stringify(
       data,
       null,
       2
     ),
-
     {
 
       status,
 
       headers: {
 
+        ...corsHeaders(),
+
         "Content-Type":
-          "application/json; charset=utf-8",
-
-        ...corsHeaders()
-
+          "application/json; charset=utf-8"
       }
-
     }
-
   );
-
 }
 
 
@@ -2683,7 +3135,5 @@ function corsHeaders() {
 
     "Access-Control-Allow-Headers":
       "Content-Type, Authorization"
-
   };
-
-        }
+  }
