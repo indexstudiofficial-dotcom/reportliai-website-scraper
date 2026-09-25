@@ -1,3 +1,38 @@
-name = "reportliai-website-scraper"
-main = "src/index.js"
-compatibility_date = "2026-09-24"
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+
+  "name": "reportli-website-scraper-v4",
+
+  "main": "src/index.js",
+
+  "compatibility_date": "2026-09-25",
+
+  "queues": {
+    "producers": [
+      {
+        "binding": "SCRAPE_QUEUE",
+        "queue": "reportli-scrape-pages"
+      }
+    ],
+
+    "consumers": [
+      {
+        "queue": "reportli-scrape-pages",
+
+        // Deliberately small because each message fetches
+        // a webpage and writes to Supabase.
+        "max_batch_size": 2,
+
+        // If fewer than 2 messages are waiting,
+        // process them after 5 seconds.
+        "max_batch_timeout": 5,
+
+        // Cloudflare will retry failed queue messages.
+        "max_retries": 3,
+
+        // Keep processing conservative at first.
+        "max_concurrency": 1
+      }
+    ]
+  }
+}
