@@ -1,23 +1,35 @@
 // ============================================================
-// Reportli AI - Website Content Scraper
+// MRME - WEBSITE KNOWLEDGE SCRAPER
 // VERSION: 2026-09-25-V1
 //
 // NO AI
 // NO SARVAM
-// NO CHUNKING
+// DETERMINISTIC WEBSITE SCRAPER
 //
-// Logic:
+// Main flow:
+//
 // Website
 //   ↓
-// Discover all pages
+// Sitemap + robots.txt + internal links
+//   ↓
+// Discover URLs
+//   ↓
+// Filter + deduplicate
 //   ↓
 // Fetch HTML
 //   ↓
-// Find H1-H6 headings
+// Remove useless HTML
 //   ↓
-// Collect text under each heading
+// Extract:
+//   - H1-H6 sections
+//   - paragraphs
+//   - lists
+//   - JSON-LD
+//   - useful links
 //   ↓
-// Save to Supabase business_data
+// Clean + deduplicate
+//   ↓
+// Save to Supabase
 // ============================================================
 
 
@@ -28,17 +40,23 @@ const VERSION = "2026-09-25-V1";
 // SETTINGS
 // ============================================================
 
-// Number of website pages processed per Worker request.
+// Number of pages processed by ONE Worker invocation.
 const PAGES_PER_BATCH = 5;
 
-// Maximum sitemap files we will recursively inspect.
-const MAX_SITEMAPS = 50;
-
-// Maximum URLs collected from sitemaps.
-// Increase this if you expect very large websites.
+// Maximum pages that can be discovered.
 const MAX_PAGES = 5000;
 
-// Website fetch timeout.
+// Maximum sitemap files that can be checked.
+const MAX_SITEMAPS = 50;
+
+// Maximum internal links discovered from each page.
+const MAX_LINKS_PER_PAGE = 100;
+
+// Maximum HTML size accepted for a page.
+// 5 MB.
+const MAX_HTML_BYTES = 5 * 1024 * 1024;
+
+// Request timeout.
 const FETCH_TIMEOUT = 15000;
 
 
@@ -71,7 +89,7 @@ export default {
     try {
 
       // --------------------------------------------------------
-      // READ REQUEST
+      // READ BODY
       // --------------------------------------------------------
 
       const body =
@@ -138,7 +156,9 @@ export default {
       // --------------------------------------------------------
 
       const website =
-        normalizeUrl(domain);
+        normalizeUrl(
+          domain
+        );
 
 
       if (!website) {
@@ -156,9 +176,14 @@ export default {
       }
 
 
+      const websiteOrigin =
+        new URL(
+          website
+        ).origin;
+
+
       // ========================================================
-      // STEP 1
-      // DISCOVER ALL WEBSITE PAGES
+      // 1. DISCOVER WEBSITE PAGES
       // ========================================================
 
       const discovery =
@@ -167,13 +192,37 @@ export default {
         );
 
 
-      const pageUrls =
+      let pageUrls =
         discovery.pages;
 
 
+      // Make absolutely sure all URLs belong
+      // to the customer's website.
+      pageUrls =
+        pageUrls
+          .filter(
+            url =>
+              sameOrigin(
+                website,
+                url
+              )
+          )
+          .filter(
+            isHtmlPage
+          );
+
+
+      // Final deduplication.
+      pageUrls =
+        Array.from(
+          new Set(
+            pageUrls
+          )
+        );
+
+
       // ========================================================
-      // STEP 2
-      // SELECT CURRENT BATCH
+      // 2. SELECT CURRENT BATCH
       // ========================================================
 
       const selectedPages =
@@ -205,7 +254,16 @@ export default {
         pages_failed:
           0,
 
-        headings_found:
+        sections_found:
+          0,
+
+        json_ld_blocks_found:
+          0,
+
+        useful_links_found:
+          0,
+
+        rows_prepared:
           0,
 
         rows_saved:
@@ -220,8 +278,7 @@ export default {
 
 
       // ========================================================
-      // STEP 3
-      // PROCESS EACH PAGE
+      // 3. PROCESS EACH PAGE
       // ========================================================
 
       for (
@@ -232,7 +289,7 @@ export default {
         try {
 
           // ----------------------------------------------------
-          // FETCH HTML
+          // FETCH PAGE
           // ----------------------------------------------------
 
           const html =
@@ -242,80 +299,69 @@ export default {
 
 
           // ----------------------------------------------------
-          // EXTRACT HEADING SECTIONS
+          // EXTRACT PAGE CONTENT
           // ----------------------------------------------------
 
-          const sections =
-            extractHeadingSections(
+          const extracted =
+            extractPageContent(
               html
             );
 
 
-          stats.headings_found +=
-            sections.length;
+          stats.sections_found +=
+            extracted.sections.length;
+
+
+          stats.json_ld_blocks_found +=
+            extracted.jsonLd.length;
+
+
+          stats.useful_links_found +=
+            extracted.links.length;
 
 
           // ----------------------------------------------------
-          // CREATE SUPABASE ROWS
+          // CREATE DATABASE ROWS
           // ----------------------------------------------------
 
-          const rows = [];
+          const rows =
+            buildRows(
+              applicationId,
+              pageUrl,
+              extracted
+            );
 
 
-          for (
-            const section
-            of sections
-          ) {
-
-            // Do not save empty sections.
-            if (
-              !section.heading ||
-              !section.text
-            ) {
-              continue;
-            }
-
-
-            rows.push({
-
-              application_id:
-                applicationId,
-
-              field:
-                section.heading,
-
-              data:
-                section.text,
-
-              source_url:
-                pageUrl
-            });
-          }
+          stats.rows_prepared +=
+            rows.length;
 
 
           // ----------------------------------------------------
-          // SAVE ALL SECTIONS FROM THIS PAGE
-          // WITH ONE SUPABASE REQUEST
+          // SAVE PAGE DATA
+          //
+          // ONE SUPABASE REQUEST PER PAGE.
           // ----------------------------------------------------
 
           if (
             rows.length > 0
           ) {
 
-            const saved =
+            const saveResult =
               await saveRows(
                 env,
                 rows
               );
 
 
-            if (!saved.success) {
+            if (
+              !saveResult.success
+            ) {
 
               stats.rows_failed +=
                 rows.length;
 
               throw new Error(
-                saved.error
+                saveResult.error
               );
             }
 
@@ -326,7 +372,7 @@ export default {
 
 
           // ----------------------------------------------------
-          // PAGE SUCCESS
+          // SUCCESS
           // ----------------------------------------------------
 
           stats.pages_processed++;
@@ -340,8 +386,14 @@ export default {
             success:
               true,
 
-            headings_found:
-              sections.length,
+            sections:
+              extracted.sections.length,
+
+            json_ld:
+              extracted.jsonLd.length,
+
+            links:
+              extracted.links.length,
 
             rows_saved:
               rows.length
@@ -374,8 +426,7 @@ export default {
 
 
       // ========================================================
-      // STEP 4
-      // PAGINATION
+      // 4. PAGINATION
       // ========================================================
 
       const nextOffset =
@@ -389,7 +440,7 @@ export default {
 
 
       // ========================================================
-      // FINAL RESPONSE
+      // RESPONSE
       // ========================================================
 
       return json({
@@ -413,7 +464,10 @@ export default {
             discovery.sitemaps_checked,
 
           sitemap_errors:
-            discovery.sitemap_errors
+            discovery.sitemap_errors,
+
+          internal_links_found:
+            discovery.internal_links_found
         },
 
         stats,
@@ -472,13 +526,17 @@ export default {
 // URL NORMALIZATION
 // ============================================================
 
-function normalizeUrl(value) {
+function normalizeUrl(
+  value
+) {
 
   try {
 
     const url =
       new URL(
-        String(value || "").trim()
+        String(
+          value || ""
+        ).trim()
       );
 
 
@@ -491,8 +549,22 @@ function normalizeUrl(value) {
     }
 
 
-    // Remove #section.
+    // Remove fragment.
     url.hash = "";
+
+
+    // Remove trailing slash except root.
+    if (
+      url.pathname.length > 1 &&
+      url.pathname.endsWith("/")
+    ) {
+
+      url.pathname =
+        url.pathname.slice(
+          0,
+          -1
+        );
+    }
 
 
     return url.href;
@@ -505,7 +577,7 @@ function normalizeUrl(value) {
 
 
 // ============================================================
-// DISCOVER ALL WEBSITE PAGES
+// DISCOVER ALL PAGES
 // ============================================================
 
 async function discoverAllPages(
@@ -513,7 +585,9 @@ async function discoverAllPages(
 ) {
 
   const origin =
-    new URL(website).origin;
+    new URL(
+      website
+    ).origin;
 
 
   const pages =
@@ -531,17 +605,22 @@ async function discoverAllPages(
   let sitemapErrors = 0;
 
 
+  let internalLinksFound = 0;
+
+
   // ----------------------------------------------------------
-  // Always include homepage
+  // Always include homepage.
   // ----------------------------------------------------------
 
   pages.add(
-    normalizeUrl(website)
+    normalizeUrl(
+      website
+    )
   );
 
 
   // ----------------------------------------------------------
-  // Common sitemap locations
+  // Common sitemap locations.
   // ----------------------------------------------------------
 
   const commonSitemaps = [
@@ -569,7 +648,7 @@ async function discoverAllPages(
 
 
   // ----------------------------------------------------------
-  // robots.txt
+  // ROBOTS.TXT
   // ----------------------------------------------------------
 
   try {
@@ -674,23 +753,9 @@ async function discoverAllPages(
       }
 
 
-      const contentType =
-        (
-          response.headers.get(
-            "content-type"
-          ) || ""
-        ).toLowerCase();
-
-
       const content =
         await response.text();
 
-
-      // ------------------------------------------------------
-      // Some servers incorrectly return
-      // text/plain for XML.
-      // Therefore we inspect the content too.
-      // ------------------------------------------------------
 
       const locations =
         extractLocs(
@@ -707,26 +772,14 @@ async function discoverAllPages(
 
 
       // ------------------------------------------------------
-      // Determine whether this is:
-      //
-      // sitemap index
-      // OR
-      // normal URL sitemap
+      // SITEMAP INDEX
       // ------------------------------------------------------
 
-      const looksLikeSitemapIndex =
+      if (
         /<sitemapindex[\s>]/i.test(
           content
-        );
-
-
-      if (
-        looksLikeSitemapIndex
+        )
       ) {
-
-        // ----------------------------------------------------
-        // THIS SITEMAP CONTAINS OTHER SITEMAPS
-        // ----------------------------------------------------
 
         for (
           const child
@@ -734,8 +787,8 @@ async function discoverAllPages(
         ) {
 
           if (
-            sitemapQueue.length +
-            checkedSitemaps.size >=
+            checkedSitemaps.size +
+            sitemapQueue.length >=
             MAX_SITEMAPS
           ) {
             break;
@@ -765,60 +818,61 @@ async function discoverAllPages(
           }
         }
 
-      } else {
 
-        // ----------------------------------------------------
-        // NORMAL URL SITEMAP
-        // ----------------------------------------------------
+        continue;
+      }
 
-        for (
-          const pageUrl
-          of locations
+
+      // ------------------------------------------------------
+      // NORMAL URL SITEMAP
+      // ------------------------------------------------------
+
+      for (
+        const pageUrl
+        of locations
+      ) {
+
+        if (
+          pages.size >=
+          MAX_PAGES
         ) {
-
-          if (
-            pages.size >=
-            MAX_PAGES
-          ) {
-            break;
-          }
-
-
-          const normalizedPage =
-            normalizeUrl(
-              pageUrl
-            );
-
-
-          if (!normalizedPage) {
-            continue;
-          }
-
-
-          if (
-            !isHtmlPage(
-              normalizedPage
-            )
-          ) {
-            continue;
-          }
-
-
-          // Only pages belonging to this website.
-          if (
-            !sameOrigin(
-              website,
-              normalizedPage
-            )
-          ) {
-            continue;
-          }
-
-
-          pages.add(
-            normalizedPage
-          );
+          break;
         }
+
+
+        const normalizedPage =
+          normalizeUrl(
+            pageUrl
+          );
+
+
+        if (!normalizedPage) {
+          continue;
+        }
+
+
+        if (
+          !sameOrigin(
+            website,
+            normalizedPage
+          )
+        ) {
+          continue;
+        }
+
+
+        if (
+          !isHtmlPage(
+            normalizedPage
+          )
+        ) {
+          continue;
+        }
+
+
+        pages.add(
+          normalizedPage
+        );
       }
 
 
@@ -829,22 +883,108 @@ async function discoverAllPages(
   }
 
 
+  // ==========================================================
+  // IMPORTANT:
+  //
+  // Sitemaps are not always complete.
+  //
+  // We also use internal links from discovered pages.
+  //
+  // To keep this Worker safe, we inspect only a limited number
+  // of already discovered pages during the discovery stage.
+  // ==========================================================
+
+  const discoveryPages =
+    Array.from(
+      pages
+    ).slice(
+      0,
+      Math.min(
+        pages.size,
+        20
+      )
+    );
+
+
+  for (
+    const pageUrl
+    of discoveryPages
+  ) {
+
+    if (
+      pages.size >=
+      MAX_PAGES
+    ) {
+      break;
+    }
+
+
+    try {
+
+      const html =
+        await fetchHtml(
+          pageUrl
+        );
+
+
+      const links =
+        extractInternalLinks(
+          html,
+          website
+        );
+
+
+      internalLinksFound +=
+        links.length;
+
+
+      for (
+        const link
+        of links
+      ) {
+
+        if (
+          pages.size >=
+          MAX_PAGES
+        ) {
+          break;
+        }
+
+
+        pages.add(
+          link
+        );
+      }
+
+
+    } catch {
+
+      // Ignore discovery failures.
+    }
+  }
+
+
   return {
 
     pages:
-      Array.from(pages),
+      Array.from(
+        pages
+      ),
 
     sitemaps_checked:
       checkedSitemaps.size,
 
     sitemap_errors:
-      sitemapErrors
+      sitemapErrors,
+
+    internal_links_found:
+      internalLinksFound
   };
 }
 
 
 // ============================================================
-// EXTRACT SITEMAP URLS FROM robots.txt
+// EXTRACT SITEMAP URLS FROM ROBOTS.TXT
 // ============================================================
 
 function extractSitemapUrls(
@@ -857,7 +997,9 @@ function extractSitemapUrls(
   const lines =
     String(
       robots || ""
-    ).split(/\r?\n/);
+    ).split(
+      /\r?\n/
+    );
 
 
   for (
@@ -938,7 +1080,7 @@ function extractLocs(
 
 
 // ============================================================
-// CHECK SAME WEBSITE
+// CHECK SAME ORIGIN
 // ============================================================
 
 function sameOrigin(
@@ -948,21 +1090,21 @@ function sameOrigin(
 
   try {
 
-    const websiteUrl =
+    const a =
       new URL(
         website
       );
 
 
-    const pageUrl =
+    const b =
       new URL(
         page
       );
 
 
     return (
-      websiteUrl.origin ===
-      pageUrl.origin
+      a.origin ===
+      b.origin
     );
 
   } catch {
@@ -973,7 +1115,7 @@ function sameOrigin(
 
 
 // ============================================================
-// CHECK WHETHER URL IS AN HTML PAGE
+// CHECK HTML PAGE
 // ============================================================
 
 function isHtmlPage(
@@ -1001,10 +1143,6 @@ function isHtmlPage(
       url.pathname.toLowerCase();
 
 
-    // --------------------------------------------------------
-    // Files that are definitely NOT HTML pages.
-    // --------------------------------------------------------
-
     const blockedExtensions = [
 
       // Data
@@ -1022,6 +1160,7 @@ function isHtmlPage(
       ".svg",
       ".ico",
       ".bmp",
+      ".tif",
       ".tiff",
 
       // Documents
@@ -1053,7 +1192,7 @@ function isHtmlPage(
       ".ogg",
       ".m4a",
 
-      // Code/assets
+      // Code
       ".js",
       ".css",
       ".map",
@@ -1093,58 +1232,7 @@ function isHtmlPage(
 
 
 // ============================================================
-// FETCH WITH TIMEOUT
-// ============================================================
-
-async function fetchWithTimeout(
-  url
-) {
-
-  const controller =
-    new AbortController();
-
-
-  const timer =
-    setTimeout(
-      () => {
-        controller.abort();
-      },
-      FETCH_TIMEOUT
-    );
-
-
-  try {
-
-    return await fetch(
-      url,
-      {
-
-        headers: {
-
-          "User-Agent":
-            "ReportliAI-WebsiteCrawler/1.0",
-
-          "Accept":
-            "text/html,application/xhtml+xml,application/xml,text/xml,text/plain"
-
-        },
-
-        signal:
-          controller.signal
-      }
-    );
-
-  } finally {
-
-    clearTimeout(
-      timer
-    );
-  }
-}
-
-
-// ============================================================
-// FETCH HTML PAGE
+// FETCH HTML
 // ============================================================
 
 async function fetchHtml(
@@ -1176,7 +1264,9 @@ async function fetchHtml(
 
 
   // ----------------------------------------------------------
-  // Reject obvious non-HTML content.
+  // Some servers don't send content-type correctly.
+  //
+  // Only reject when the server clearly says it is NOT HTML.
   // ----------------------------------------------------------
 
   if (
@@ -1195,36 +1285,247 @@ async function fetchHtml(
   }
 
 
-  return await response.text();
+  // ----------------------------------------------------------
+  // Check Content-Length when available.
+  // ----------------------------------------------------------
+
+  const contentLength =
+    Number(
+      response.headers.get(
+        "content-length"
+      ) || 0
+    );
+
+
+  if (
+    contentLength >
+    MAX_HTML_BYTES
+  ) {
+
+    throw new Error(
+      "HTML page is too large"
+    );
+  }
+
+
+  const text =
+    await response.text();
+
+
+  if (
+    text.length >
+    MAX_HTML_BYTES
+  ) {
+
+    throw new Error(
+      "HTML page is too large"
+    );
+  }
+
+
+  return text;
 }
 
 
 // ============================================================
-// EXTRACT HEADING SECTIONS
-//
-// Example:
-//
-// <h2>Services</h2>
-// <p>Dental implants.</p>
-// <p>Braces.</p>
-//
-// <h3>Dental Implants</h3>
-// <p>Implants information.</p>
-//
-// Produces:
-//
-// {
-//   heading: "Services",
-//   text: "Dental implants. Braces."
-// }
-//
-// {
-//   heading: "Dental Implants",
-//   text: "Implants information."
-// }
+// FETCH WITH TIMEOUT
 // ============================================================
 
-function extractHeadingSections(
+async function fetchWithTimeout(
+  url
+) {
+
+  const controller =
+    new AbortController();
+
+
+  const timer =
+    setTimeout(
+      () => {
+        controller.abort();
+      },
+      FETCH_TIMEOUT
+    );
+
+
+  try {
+
+    return await fetch(
+      url,
+      {
+
+        method:
+          "GET",
+
+        redirect:
+          "follow",
+
+        headers: {
+
+          "User-Agent":
+            "MRME-WebsiteCrawler/1.0",
+
+          "Accept":
+            "text/html,application/xhtml+xml,application/xml,text/xml,text/plain"
+
+        },
+
+        signal:
+          controller.signal
+      }
+    );
+
+  } finally {
+
+    clearTimeout(
+      timer
+    );
+  }
+}
+
+
+// ============================================================
+// EXTRACT INTERNAL LINKS
+// ============================================================
+
+function extractInternalLinks(
+  html,
+  website
+) {
+
+  const output =
+    new Set();
+
+
+  const regex =
+    /<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>/gi;
+
+
+  let match;
+
+
+  let count = 0;
+
+
+  while (
+    (match =
+      regex.exec(html))
+  ) {
+
+    if (
+      count >=
+      MAX_LINKS_PER_PAGE
+    ) {
+      break;
+    }
+
+
+    const rawHref =
+      decodeHtmlEntities(
+        match[1]
+      ).trim();
+
+
+    if (!rawHref) {
+      continue;
+    }
+
+
+    // Ignore anchors.
+    if (
+      rawHref.startsWith("#")
+    ) {
+      continue;
+    }
+
+
+    // Ignore javascript/mail/tel.
+    if (
+      /^(javascript:|mailto:|tel:|sms:)/i.test(
+        rawHref
+      )
+    ) {
+      continue;
+    }
+
+
+    try {
+
+      const absolute =
+        new URL(
+          rawHref,
+          website
+        );
+
+
+      absolute.hash = "";
+
+
+      if (
+        absolute.protocol !==
+          "http:" &&
+        absolute.protocol !==
+          "https:"
+      ) {
+        continue;
+      }
+
+
+      const normalized =
+        normalizeUrl(
+          absolute.href
+        );
+
+
+      if (!normalized) {
+        continue;
+      }
+
+
+      if (
+        !sameOrigin(
+          website,
+          normalized
+        )
+      ) {
+        continue;
+      }
+
+
+      if (
+        !isHtmlPage(
+          normalized
+        )
+      ) {
+        continue;
+      }
+
+
+      output.add(
+        normalized
+      );
+
+
+      count++;
+
+    } catch {
+
+      // Invalid URL.
+    }
+  }
+
+
+  return Array.from(
+    output
+  );
+}
+
+
+// ============================================================
+// EXTRACT COMPLETE PAGE CONTENT
+// ============================================================
+
+function extractPageContent(
   html
 ) {
 
@@ -1235,28 +1536,101 @@ function extractHeadingSections(
 
 
   // ----------------------------------------------------------
-  // Remove sections that usually contain navigation,
-  // scripts, styles and unrelated page content.
+  // Extract JSON-LD BEFORE removing script tags.
+  // ----------------------------------------------------------
+
+  const jsonLd =
+    extractJsonLd(
+      source
+    );
+
+
+  // ----------------------------------------------------------
+  // Extract internal links BEFORE cleaning.
+  // ----------------------------------------------------------
+
+  const links =
+    extractUsefulLinks(
+      source
+    );
+
+
+  // ----------------------------------------------------------
+  // Remove useless sections.
   // ----------------------------------------------------------
 
   source =
     source.replace(
 
-      /<(script|style|noscript|svg|canvas|iframe|nav|footer|aside)[^>]*>[\s\S]*?<\/\1>/gi,
+      /<(script|style|noscript|svg|canvas|iframe|nav|footer|aside|template)[^>]*>[\s\S]*?<\/\1>/gi,
 
       " "
     );
 
 
   // ----------------------------------------------------------
-  // Find H1-H6 and text in between.
+  // Extract H1-H6 sections.
   // ----------------------------------------------------------
+
+  const sections =
+    extractSections(
+      source
+    );
+
+
+  // ----------------------------------------------------------
+  // If there are no headings, also create a main-content
+  // section from visible text.
+  // ----------------------------------------------------------
+
+  if (
+    sections.length === 0
+  ) {
+
+    const bodyText =
+      htmlToText(
+        source
+      );
+
+
+    if (bodyText) {
+
+      sections.push({
+
+        heading:
+          "page_content",
+
+        text:
+          bodyText
+      });
+    }
+  }
+
+
+  return {
+
+    sections,
+
+    jsonLd,
+
+    links
+  };
+}
+
+
+// ============================================================
+// EXTRACT H1-H6 SECTIONS
+// ============================================================
+
+function extractSections(
+  html
+) {
+
+  const matches = [];
+
 
   const headingRegex =
     /<(h[1-6])\b[^>]*>([\s\S]*?)<\/\1>/gi;
-
-
-  const matches = [];
 
 
   let match;
@@ -1264,21 +1638,18 @@ function extractHeadingSections(
 
   while (
     (match =
-      headingRegex.exec(source))
+      headingRegex.exec(html))
   ) {
 
-    const headingTag =
-      match[1]
-        .toLowerCase();
-
-
-    const headingText =
-      htmlToText(
-        match[2]
+    const heading =
+      cleanText(
+        htmlToText(
+          match[2]
+        )
       );
 
 
-    if (!headingText) {
+    if (!heading) {
       continue;
     }
 
@@ -1287,11 +1658,10 @@ function extractHeadingSections(
 
       level:
         Number(
-          headingTag.substring(1)
+          match[1].substring(1)
         ),
 
-      heading:
-        headingText,
+      heading,
 
       start:
         match.index,
@@ -1304,10 +1674,6 @@ function extractHeadingSections(
 
   const sections = [];
 
-
-  // ----------------------------------------------------------
-  // For every heading, collect content until the next heading.
-  // ----------------------------------------------------------
 
   for (
     let i = 0;
@@ -1330,19 +1696,21 @@ function extractHeadingSections(
     const contentEnd =
       next
         ? next.start
-        : source.length;
+        : html.length;
 
 
     const rawContent =
-      source.slice(
+      html.slice(
         contentStart,
         contentEnd
       );
 
 
     const text =
-      htmlToText(
-        rawContent
+      cleanText(
+        htmlToText(
+          rawContent
+        )
       );
 
 
@@ -1356,8 +1724,10 @@ function extractHeadingSections(
       heading:
         current.heading,
 
-      text
+      text,
 
+      level:
+        current.level
     });
   }
 
@@ -1367,7 +1737,777 @@ function extractHeadingSections(
 
 
 // ============================================================
-// CONVERT HTML TO CLEAN TEXT
+// EXTRACT JSON-LD
+// ============================================================
+
+function extractJsonLd(
+  html
+) {
+
+  const output = [];
+
+
+  const regex =
+    /<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+
+
+  let match;
+
+
+  while (
+    (match =
+      regex.exec(html))
+  ) {
+
+    const raw =
+      match[1]
+        .trim();
+
+
+    if (!raw) {
+      continue;
+    }
+
+
+    try {
+
+      const parsed =
+        JSON.parse(
+          raw
+        );
+
+
+      output.push(
+        parsed
+      );
+
+    } catch {
+
+      // Invalid JSON-LD.
+    }
+  }
+
+
+  return output;
+}
+
+
+// ============================================================
+// EXTRACT USEFUL LINKS
+// ============================================================
+
+function extractUsefulLinks(
+  html
+) {
+
+  const output = [];
+
+
+  const regex =
+    /<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+
+
+  let match;
+
+
+  while (
+    (match =
+      regex.exec(html))
+  ) {
+
+    const href =
+      decodeHtmlEntities(
+        match[1]
+      ).trim();
+
+
+    const text =
+      cleanText(
+        htmlToText(
+          match[2]
+        )
+      );
+
+
+    if (!href) {
+      continue;
+    }
+
+
+    if (
+      !text
+    ) {
+      continue;
+    }
+
+
+    if (
+      /^(javascript:|mailto:|tel:|sms:|#)/i.test(
+        href
+      )
+    ) {
+      continue;
+    }
+
+
+    output.push({
+
+      text,
+
+      href
+
+    });
+
+
+    if (
+      output.length >=
+      MAX_LINKS_PER_PAGE
+    ) {
+      break;
+    }
+  }
+
+
+  return output;
+}
+
+
+// ============================================================
+// BUILD DATABASE ROWS
+// ============================================================
+
+function buildRows(
+  applicationId,
+  pageUrl,
+  extracted
+) {
+
+  const rows = [];
+
+
+  // ----------------------------------------------------------
+  // SECTION CONTENT
+  // ----------------------------------------------------------
+
+  for (
+    const section
+    of extracted.sections
+  ) {
+
+    const heading =
+      cleanFieldName(
+        section.heading
+      );
+
+
+    const text =
+      cleanText(
+        section.text
+      );
+
+
+    if (
+      !heading ||
+      !text
+    ) {
+      continue;
+    }
+
+
+    rows.push({
+
+      application_id:
+        applicationId,
+
+      field:
+        heading,
+
+      data:
+        text,
+
+      source_url:
+        pageUrl
+    });
+  }
+
+
+  // ----------------------------------------------------------
+  // JSON-LD
+  //
+  // Store useful structured business information.
+  // We don't save the entire JSON object as one field.
+  // ----------------------------------------------------------
+
+  const structured =
+    extractUsefulJsonLdFields(
+      extracted.jsonLd
+    );
+
+
+  for (
+    const item
+    of structured
+  ) {
+
+    if (
+      !item.field ||
+      !item.data
+    ) {
+      continue;
+    }
+
+
+    rows.push({
+
+      application_id:
+        applicationId,
+
+      field:
+        item.field,
+
+      data:
+        item.data,
+
+      source_url:
+        pageUrl
+    });
+  }
+
+
+  // ----------------------------------------------------------
+  // REMOVE DUPLICATE ROWS WITHIN THIS PAGE.
+  // ----------------------------------------------------------
+
+  return deduplicateRows(
+    rows
+  );
+}
+
+
+// ============================================================
+// EXTRACT USEFUL JSON-LD FIELDS
+// ============================================================
+
+function extractUsefulJsonLdFields(
+  blocks
+) {
+
+  const output = [];
+
+
+  for (
+    const block
+    of blocks
+  ) {
+
+    processJsonLdObject(
+      block,
+      output
+    );
+  }
+
+
+  return output;
+}
+
+
+// ============================================================
+// PROCESS JSON-LD OBJECT
+// ============================================================
+
+function processJsonLdObject(
+  value,
+  output
+) {
+
+  if (
+    !value
+  ) {
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Array
+  // ----------------------------------------------------------
+
+  if (
+    Array.isArray(value)
+  ) {
+
+    for (
+      const item
+      of value
+    ) {
+
+      processJsonLdObject(
+        item,
+        output
+      );
+    }
+
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Non-object
+  // ----------------------------------------------------------
+
+  if (
+    typeof value !==
+    "object"
+  ) {
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // @graph
+  // ----------------------------------------------------------
+
+  if (
+    Array.isArray(
+      value["@graph"]
+    )
+  ) {
+
+    processJsonLdObject(
+      value["@graph"],
+      output
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // @type
+  // ----------------------------------------------------------
+
+  const type =
+    value["@type"];
+
+
+  // ----------------------------------------------------------
+  // Business name
+  // ----------------------------------------------------------
+
+  if (
+    value.name
+  ) {
+
+    addJsonField(
+      output,
+      "structured_business_name",
+      value.name
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Telephone
+  // ----------------------------------------------------------
+
+  if (
+    value.telephone
+  ) {
+
+    addJsonField(
+      output,
+      "phone",
+      value.telephone
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Email
+  // ----------------------------------------------------------
+
+  if (
+    value.email
+  ) {
+
+    addJsonField(
+      output,
+      "email",
+      value.email
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // URL
+  // ----------------------------------------------------------
+
+  if (
+    value.url
+  ) {
+
+    addJsonField(
+      output,
+      "website",
+      value.url
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Price range
+  // ----------------------------------------------------------
+
+  if (
+    value.priceRange
+  ) {
+
+    addJsonField(
+      output,
+      "price_range",
+      value.priceRange
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Address
+  // ----------------------------------------------------------
+
+  if (
+    value.address
+  ) {
+
+    const address =
+      formatAddress(
+        value.address
+      );
+
+
+    if (address) {
+
+      addJsonField(
+        output,
+        "address",
+        address
+      );
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // Opening hours
+  // ----------------------------------------------------------
+
+  if (
+    value.openingHours
+  ) {
+
+    addJsonField(
+      output,
+      "opening_hours",
+      value.openingHours
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Opening hours specification
+  // ----------------------------------------------------------
+
+  if (
+    value.openingHoursSpecification
+  ) {
+
+    addJsonField(
+      output,
+      "opening_hours",
+      value.openingHoursSpecification
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // SameAs social links
+  // ----------------------------------------------------------
+
+  if (
+    Array.isArray(
+      value.sameAs
+    )
+  ) {
+
+    addJsonField(
+      output,
+      "social_profiles",
+      value.sameAs
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Service
+  // ----------------------------------------------------------
+
+  if (
+    value.serviceType
+  ) {
+
+    addJsonField(
+      output,
+      "service_type",
+      value.serviceType
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Description
+  // ----------------------------------------------------------
+
+  if (
+    value.description
+  ) {
+
+    addJsonField(
+      output,
+      "structured_description",
+      value.description
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Don't need type currently, but touching it makes it clear
+  // that @type is intentionally available for future versions.
+  // ----------------------------------------------------------
+
+  void type;
+}
+
+
+// ============================================================
+// ADD JSON FIELD
+// ============================================================
+
+function addJsonField(
+  output,
+  field,
+  data
+) {
+
+  if (
+    data === null ||
+    data === undefined
+  ) {
+    return;
+  }
+
+
+  if (
+    typeof data ===
+    "string"
+  ) {
+
+    const value =
+      cleanText(
+        data
+      );
+
+
+    if (!value) {
+      return;
+    }
+
+
+    output.push({
+
+      field,
+
+      data:
+        value
+    });
+
+
+    return;
+  }
+
+
+  if (
+    Array.isArray(data)
+  ) {
+
+    const values =
+      data.filter(
+        item =>
+          item !== null &&
+          item !== undefined &&
+          item !== ""
+      );
+
+
+    if (
+      values.length === 0
+    ) {
+      return;
+    }
+
+
+    output.push({
+
+      field,
+
+      data:
+        values
+    });
+
+
+    return;
+  }
+
+
+  if (
+    typeof data ===
+    "object"
+  ) {
+
+    if (
+      Object.keys(
+        data
+      ).length === 0
+    ) {
+      return;
+    }
+
+
+    output.push({
+
+      field,
+
+      data
+    });
+  }
+}
+
+
+// ============================================================
+// FORMAT ADDRESS
+// ============================================================
+
+function formatAddress(
+  address
+) {
+
+  if (
+    typeof address ===
+    "string"
+  ) {
+
+    return cleanText(
+      address
+    );
+  }
+
+
+  if (
+    !address ||
+    typeof address !==
+      "object"
+  ) {
+
+    return null;
+  }
+
+
+  const parts = [
+
+    address.streetAddress,
+
+    address.addressLocality,
+
+    address.addressRegion,
+
+    address.postalCode,
+
+    address.addressCountry
+
+  ];
+
+
+  const cleaned =
+    parts
+      .filter(
+        value =>
+          value !== null &&
+          value !== undefined &&
+          String(value).trim()
+      )
+      .map(
+        value =>
+          String(value).trim()
+      );
+
+
+  return cleaned.length
+    ? cleaned.join(", ")
+    : null;
+}
+
+
+// ============================================================
+// CLEAN FIELD NAME
+// ============================================================
+
+function cleanFieldName(
+  value
+) {
+
+  return String(
+    value || ""
+  )
+
+    .trim()
+
+    .toLowerCase()
+
+    .replace(
+      /[^a-z0-9]+/g,
+      "_"
+    )
+
+    .replace(
+      /^_+|_+$/g,
+      ""
+    )
+
+    .slice(
+      0,
+      150
+    );
+}
+
+
+// ============================================================
+// CLEAN TEXT
+// ============================================================
+
+function cleanText(
+  value
+) {
+
+  return String(
+    value || ""
+  )
+
+    .replace(
+      /\s+/g,
+      " "
+    )
+
+    .trim();
+}
+
+
+// ============================================================
+// CONVERT HTML TO TEXT
 // ============================================================
 
 function htmlToText(
@@ -1380,10 +2520,7 @@ function htmlToText(
     );
 
 
-  // ----------------------------------------------------------
-  // Remove comments
-  // ----------------------------------------------------------
-
+  // Remove comments.
   value =
     value.replace(
       /<!--[\s\S]*?-->/g,
@@ -1391,21 +2528,17 @@ function htmlToText(
     );
 
 
-  // ----------------------------------------------------------
-  // Convert common block tags to spaces.
-  // ----------------------------------------------------------
-
+  // Turn common block elements into spaces.
   value =
     value.replace(
+
       /<(br|p|div|section|article|li|ul|ol|table|tr|td|th|blockquote|pre|address|figure|figcaption)[^>]*>/gi,
+
       " "
     );
 
 
-  // ----------------------------------------------------------
-  // Remove remaining HTML tags.
-  // ----------------------------------------------------------
-
+  // Remove tags.
   value =
     value.replace(
       /<[^>]+>/g,
@@ -1413,30 +2546,16 @@ function htmlToText(
     );
 
 
-  // ----------------------------------------------------------
   // Decode entities.
-  // ----------------------------------------------------------
-
   value =
     decodeHtmlEntities(
       value
     );
 
 
-  // ----------------------------------------------------------
-  // Normalize whitespace.
-  // ----------------------------------------------------------
-
-  value =
+  return cleanText(
     value
-      .replace(
-        /\s+/g,
-        " "
-      )
-      .trim();
-
-
-  return value;
+  );
 }
 
 
@@ -1487,7 +2606,7 @@ function decodeHtmlEntities(
       ">"
     )
 
-    // Decimal entities
+    // Decimal HTML entities.
     .replace(
       /&#(\d+);/g,
       (_, code) => {
@@ -1505,7 +2624,7 @@ function decodeHtmlEntities(
       }
     )
 
-    // Hex entities
+    // Hex HTML entities.
     .replace(
       /&#x([0-9a-f]+);/gi,
       (_, code) => {
@@ -1525,6 +2644,61 @@ function decodeHtmlEntities(
         }
       }
     );
+}
+
+
+// ============================================================
+// DEDUPLICATE ROWS
+// ============================================================
+
+function deduplicateRows(
+  rows
+) {
+
+  const output = [];
+
+
+  const seen =
+    new Set();
+
+
+  for (
+    const row
+    of rows
+  ) {
+
+    const key =
+      [
+        row.application_id,
+        row.source_url,
+        row.field,
+        JSON.stringify(
+          row.data
+        )
+      ].join(
+        "|"
+      );
+
+
+    if (
+      seen.has(key)
+    ) {
+      continue;
+    }
+
+
+    seen.add(
+      key
+    );
+
+
+    output.push(
+      row
+    );
+  }
+
+
+  return output;
 }
 
 
@@ -1568,11 +2742,15 @@ async function saveRows(
 
 
     // --------------------------------------------------------
-    // IMPORTANT:
+    // IMPORTANT
     //
-    // Your business_data table should have:
+    // This requires:
     //
-    // UNIQUE(application_id, source_url, field)
+    // UNIQUE (
+    //   application_id,
+    //   source_url,
+    //   field
+    // )
     //
     // --------------------------------------------------------
 
@@ -1679,8 +2857,7 @@ function json(
 
         "Cache-Control":
           "no-store"
-
       }
     }
   );
-  }
+                }
