@@ -1,103 +1,195 @@
 // ============================================================
-// Reportli AI Website Scraper
-// VERSION: 2026-09-25-V3
+// Reportli AI - Website Content Scraper
+// VERSION: 2026-09-25-V1
+//
+// NO AI
+// NO SARVAM
+// NO CHUNKING
+//
+// Logic:
+// Website
+//   ↓
+// Discover all pages
+//   ↓
+// Fetch HTML
+//   ↓
+// Find H1-H6 headings
+//   ↓
+// Collect text under each heading
+//   ↓
+// Save to Supabase business_data
 // ============================================================
 
-const VERSION = "2026-09-25-V3";
 
-const PAGES_PER_BATCH = 3;
-const MAX_AI_CALLS = 6;
-const MAX_CHUNKS_PER_PAGE = 2;
+const VERSION = "2026-09-25-V1";
 
-const CHUNK_SIZE = 7000;
-const CHUNK_OVERLAP = 500;
 
+// ============================================================
+// SETTINGS
+// ============================================================
+
+// Number of website pages processed per Worker request.
+const PAGES_PER_BATCH = 5;
+
+// Maximum sitemap files we will recursively inspect.
+const MAX_SITEMAPS = 50;
+
+// Maximum URLs collected from sitemaps.
+// Increase this if you expect very large websites.
+const MAX_PAGES = 5000;
+
+// Website fetch timeout.
 const FETCH_TIMEOUT = 15000;
 
 
 // ============================================================
-// WORKER
+// MAIN WORKER
 // ============================================================
 
 export default {
+
   async fetch(request, env) {
 
+    // ----------------------------------------------------------
+    // ONLY POST
+    // ----------------------------------------------------------
+
     if (request.method !== "POST") {
+
       return json({
+
         success: false,
+
         worker_version: VERSION,
+
         error: "POST required"
+
       }, 405);
     }
 
+
     try {
 
-      const body = await request.json();
+      // --------------------------------------------------------
+      // READ REQUEST
+      // --------------------------------------------------------
+
+      const body =
+        await request.json();
+
 
       const applicationId =
-        String(body.application_id || "").trim();
+        String(
+          body.application_id || ""
+        ).trim();
+
 
       const domain =
-        String(body.domain || "").trim();
+        String(
+          body.domain || ""
+        ).trim();
+
 
       const pageOffset =
         Math.max(
           0,
-          Number(body.page_offset || 0)
+          Number(
+            body.page_offset || 0
+          )
         );
 
+
+      // --------------------------------------------------------
+      // VALIDATION
+      // --------------------------------------------------------
+
       if (!applicationId) {
+
         return json({
+
           success: false,
+
           worker_version: VERSION,
-          error: "application_id required"
+
+          error:
+            "application_id required"
+
         }, 400);
       }
 
+
       if (!domain) {
+
         return json({
+
           success: false,
+
           worker_version: VERSION,
-          error: "domain required"
+
+          error:
+            "domain required"
+
         }, 400);
       }
+
+
+      // --------------------------------------------------------
+      // NORMALIZE WEBSITE
+      // --------------------------------------------------------
 
       const website =
         normalizeUrl(domain);
 
 
+      if (!website) {
+
+        return json({
+
+          success: false,
+
+          worker_version: VERSION,
+
+          error:
+            "Invalid website URL"
+
+        }, 400);
+      }
+
+
       // ========================================================
-      // DISCOVER
+      // STEP 1
+      // DISCOVER ALL WEBSITE PAGES
       // ========================================================
 
-      const discovered =
-        await discoverUrls(website);
+      const discovery =
+        await discoverAllPages(
+          website
+        );
 
-
-      // ========================================================
-      // ONLY REAL HTML PAGES
-      // ========================================================
 
       const pageUrls =
-        Array.from(
-          new Set(
-            discovered
-              .map(normalizeUrl)
-              .filter(isHtmlPage)
-          )
-        );
+        discovery.pages;
 
 
       // ========================================================
-      // CURRENT BATCH
+      // STEP 2
+      // SELECT CURRENT BATCH
       // ========================================================
 
-      const selected =
+      const selectedPages =
         pageUrls.slice(
+
           pageOffset,
-          pageOffset + PAGES_PER_BATCH
+
+          pageOffset +
+            PAGES_PER_BATCH
+
         );
 
+
+      // ========================================================
+      // STATISTICS
+      // ========================================================
 
       const stats = {
 
@@ -105,7 +197,7 @@ export default {
           pageUrls.length,
 
         pages_selected:
-          selected.length,
+          selectedPages.length,
 
         pages_processed:
           0,
@@ -113,19 +205,13 @@ export default {
         pages_failed:
           0,
 
-        chunks_sent_to_ai:
+        headings_found:
           0,
 
-        fields_extracted:
+        rows_saved:
           0,
 
-        fields_saved:
-          0,
-
-        fields_failed:
-          0,
-
-        sarvam_errors:
+        rows_failed:
           0
       };
 
@@ -134,153 +220,58 @@ export default {
 
 
       // ========================================================
+      // STEP 3
       // PROCESS EACH PAGE
       // ========================================================
 
-      for (const pageUrl of selected) {
+      for (
+        const pageUrl
+        of selectedPages
+      ) {
 
         try {
 
           // ----------------------------------------------------
-          // FETCH
+          // FETCH HTML
           // ----------------------------------------------------
 
           const html =
-            await fetchHtml(pageUrl);
-
-
-          // ----------------------------------------------------
-          // TEXT
-          // ----------------------------------------------------
-
-          const page =
-            extractText(html);
-
-
-          if (!page.text) {
-            throw new Error(
-              "No readable text found"
-            );
-          }
-
-
-          // ----------------------------------------------------
-          // CHUNKS
-          // ----------------------------------------------------
-
-          const chunks =
-            splitText(
-              page.text,
-              CHUNK_SIZE,
-              CHUNK_OVERLAP
-            ).slice(
-              0,
-              MAX_CHUNKS_PER_PAGE
+            await fetchHtml(
+              pageUrl
             );
 
 
-          const fieldMap =
-            new Map();
+          // ----------------------------------------------------
+          // EXTRACT HEADING SECTIONS
+          // ----------------------------------------------------
+
+          const sections =
+            extractHeadingSections(
+              html
+            );
+
+
+          stats.headings_found +=
+            sections.length;
 
 
           // ----------------------------------------------------
-          // SARVAM
-          // ----------------------------------------------------
-
-          for (const chunk of chunks) {
-
-            if (
-              stats.chunks_sent_to_ai >=
-              MAX_AI_CALLS
-            ) {
-              break;
-            }
-
-
-            const result =
-              await askSarvam(
-                env,
-                chunk
-              );
-
-
-            stats.chunks_sent_to_ai++;
-
-
-            if (result.error) {
-
-              stats.sarvam_errors++;
-
-              continue;
-            }
-
-
-            for (
-              const item
-              of result.fields
-            ) {
-
-              if (
-                !item ||
-                typeof item !== "object"
-              ) {
-                continue;
-              }
-
-
-              const field =
-                cleanField(
-                  item.field
-                );
-
-
-              const data =
-                cleanData(
-                  item.data
-                );
-
-
-              // NEVER save empty values.
-              if (!field) continue;
-              if (!useful(data)) continue;
-
-
-              if (
-                fieldMap.has(field)
-              ) {
-
-                fieldMap.set(
-                  field,
-                  merge(
-                    fieldMap.get(field),
-                    data
-                  )
-                );
-
-              } else {
-
-                fieldMap.set(
-                  field,
-                  data
-                );
-              }
-            }
-          }
-
-
-          // ----------------------------------------------------
-          // SUPABASE ROWS
+          // CREATE SUPABASE ROWS
           // ----------------------------------------------------
 
           const rows = [];
 
 
           for (
-            const [field, data]
-            of fieldMap
+            const section
+            of sections
           ) {
 
-            if (!useful(data)) {
+            // Do not save empty sections.
+            if (
+              !section.heading ||
+              !section.text
+            ) {
               continue;
             }
 
@@ -290,9 +281,11 @@ export default {
               application_id:
                 applicationId,
 
-              field,
+              field:
+                section.heading,
 
-              data,
+              data:
+                section.text,
 
               source_url:
                 pageUrl
@@ -300,15 +293,14 @@ export default {
           }
 
 
-          stats.fields_extracted +=
-            rows.length;
-
-
           // ----------------------------------------------------
-          // ONE BULK SAVE
+          // SAVE ALL SECTIONS FROM THIS PAGE
+          // WITH ONE SUPABASE REQUEST
           // ----------------------------------------------------
 
-          if (rows.length > 0) {
+          if (
+            rows.length > 0
+          ) {
 
             const saved =
               await saveRows(
@@ -319,7 +311,7 @@ export default {
 
             if (!saved.success) {
 
-              stats.fields_failed +=
+              stats.rows_failed +=
                 rows.length;
 
               throw new Error(
@@ -328,38 +320,50 @@ export default {
             }
 
 
-            stats.fields_saved +=
+            stats.rows_saved +=
               rows.length;
           }
 
+
+          // ----------------------------------------------------
+          // PAGE SUCCESS
+          // ----------------------------------------------------
 
           stats.pages_processed++;
 
 
           pageResults.push({
 
-            url: pageUrl,
+            url:
+              pageUrl,
 
-            success: true,
+            success:
+              true,
 
-            fields_extracted:
-              rows.length,
+            headings_found:
+              sections.length,
 
-            fields_saved:
+            rows_saved:
               rows.length
           });
 
 
         } catch (error) {
 
+          // ----------------------------------------------------
+          // PAGE FAILED
+          // ----------------------------------------------------
+
           stats.pages_failed++;
 
 
           pageResults.push({
 
-            url: pageUrl,
+            url:
+              pageUrl,
 
-            success: false,
+            success:
+              false,
 
             error:
               error?.message ||
@@ -370,12 +374,13 @@ export default {
 
 
       // ========================================================
+      // STEP 4
       // PAGINATION
       // ========================================================
 
       const nextOffset =
         pageOffset +
-        selected.length;
+        selectedPages.length;
 
 
       const hasMore =
@@ -384,7 +389,7 @@ export default {
 
 
       // ========================================================
-      // RESPONSE
+      // FINAL RESPONSE
       // ========================================================
 
       return json({
@@ -398,6 +403,18 @@ export default {
           applicationId,
 
         website,
+
+        discovery: {
+
+          pages_found:
+            pageUrls.length,
+
+          sitemaps_checked:
+            discovery.sitemaps_checked,
+
+          sitemap_errors:
+            discovery.sitemap_errors
+        },
 
         stats,
 
@@ -421,12 +438,18 @@ export default {
 
         message:
           hasMore
+
             ? `Continue with page_offset=${nextOffset}`
+
             : "All pages processed."
       });
 
 
     } catch (error) {
+
+      // ========================================================
+      // GLOBAL ERROR
+      // ========================================================
 
       return json({
 
@@ -455,11 +478,20 @@ function normalizeUrl(value) {
 
     const url =
       new URL(
-        String(value).trim()
+        String(value || "").trim()
       );
 
 
-    // Remove #section
+    if (
+      url.protocol !== "http:" &&
+      url.protocol !== "https:"
+    ) {
+
+      return null;
+    }
+
+
+    // Remove #section.
     url.hash = "";
 
 
@@ -467,27 +499,43 @@ function normalizeUrl(value) {
 
   } catch {
 
-    return String(value).trim();
+    return null;
   }
 }
 
 
 // ============================================================
-// DISCOVER URLS
+// DISCOVER ALL WEBSITE PAGES
 // ============================================================
 
-async function discoverUrls(website) {
+async function discoverAllPages(
+  website
+) {
 
   const origin =
     new URL(website).origin;
 
 
-  const urls =
+  const pages =
     new Set();
 
 
-  // Always include homepage.
-  urls.add(
+  const sitemapQueue =
+    [];
+
+
+  const checkedSitemaps =
+    new Set();
+
+
+  let sitemapErrors = 0;
+
+
+  // ----------------------------------------------------------
+  // Always include homepage
+  // ----------------------------------------------------------
+
+  pages.add(
     normalizeUrl(website)
   );
 
@@ -496,189 +544,364 @@ async function discoverUrls(website) {
   // Common sitemap locations
   // ----------------------------------------------------------
 
-  const sitemapCandidates = [
+  const commonSitemaps = [
 
     `${origin}/sitemap.xml`,
 
     `${origin}/wp-sitemap.xml`,
 
-    `${origin}/sitemap_index.xml`
+    `${origin}/sitemap_index.xml`,
+
+    `${origin}/sitemap-index.xml`
 
   ];
 
 
   for (
     const sitemap
-    of sitemapCandidates
+    of commonSitemaps
   ) {
+
+    sitemapQueue.push(
+      sitemap
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // robots.txt
+  // ----------------------------------------------------------
+
+  try {
+
+    const robotsResponse =
+      await fetchWithTimeout(
+        `${origin}/robots.txt`
+      );
+
+
+    if (
+      robotsResponse.ok
+    ) {
+
+      const robots =
+        await robotsResponse.text();
+
+
+      const robotSitemaps =
+        extractSitemapUrls(
+          robots
+        );
+
+
+      for (
+        const sitemap
+        of robotSitemaps
+      ) {
+
+        sitemapQueue.push(
+          sitemap
+        );
+      }
+    }
+
+  } catch {
+
+    // robots.txt is optional.
+  }
+
+
+  // ----------------------------------------------------------
+  // PROCESS SITEMAPS
+  // ----------------------------------------------------------
+
+  while (
+
+    sitemapQueue.length > 0 &&
+
+    checkedSitemaps.size <
+      MAX_SITEMAPS &&
+
+    pages.size <
+      MAX_PAGES
+
+  ) {
+
+    const sitemap =
+      sitemapQueue.shift();
+
+
+    const normalizedSitemap =
+      normalizeUrl(
+        sitemap
+      );
+
+
+    if (!normalizedSitemap) {
+      continue;
+    }
+
+
+    if (
+      checkedSitemaps.has(
+        normalizedSitemap
+      )
+    ) {
+      continue;
+    }
+
+
+    checkedSitemaps.add(
+      normalizedSitemap
+    );
+
 
     try {
 
       const response =
-        await fetch(
-          sitemap,
-          {
-            headers: {
-              "User-Agent":
-                "ReportliAI/1.0"
-            }
-          }
+        await fetchWithTimeout(
+          normalizedSitemap
         );
 
 
-      if (!response.ok) {
+      if (
+        !response.ok
+      ) {
+
+        sitemapErrors++;
+
         continue;
       }
 
 
-      const xml =
+      const contentType =
+        (
+          response.headers.get(
+            "content-type"
+          ) || ""
+        ).toLowerCase();
+
+
+      const content =
         await response.text();
 
 
+      // ------------------------------------------------------
+      // Some servers incorrectly return
+      // text/plain for XML.
+      // Therefore we inspect the content too.
+      // ------------------------------------------------------
+
       const locations =
-        extractLocs(xml);
+        extractLocs(
+          content
+        );
 
 
-      for (
-        const url
-        of locations
+      if (
+        locations.length === 0
       ) {
 
-        // Never add XML files.
-        if (
-          url
-            .toLowerCase()
-            .split("?")[0]
-            .endsWith(".xml")
+        continue;
+      }
+
+
+      // ------------------------------------------------------
+      // Determine whether this is:
+      //
+      // sitemap index
+      // OR
+      // normal URL sitemap
+      // ------------------------------------------------------
+
+      const looksLikeSitemapIndex =
+        /<sitemapindex[\s>]/i.test(
+          content
+        );
+
+
+      if (
+        looksLikeSitemapIndex
+      ) {
+
+        // ----------------------------------------------------
+        // THIS SITEMAP CONTAINS OTHER SITEMAPS
+        // ----------------------------------------------------
+
+        for (
+          const child
+          of locations
         ) {
-          continue;
+
+          if (
+            sitemapQueue.length +
+            checkedSitemaps.size >=
+            MAX_SITEMAPS
+          ) {
+            break;
+          }
+
+
+          const childUrl =
+            normalizeUrl(
+              child
+            );
+
+
+          if (!childUrl) {
+            continue;
+          }
+
+
+          if (
+            !checkedSitemaps.has(
+              childUrl
+            )
+          ) {
+
+            sitemapQueue.push(
+              childUrl
+            );
+          }
         }
 
+      } else {
 
-        if (
-          isHtmlPage(url)
+        // ----------------------------------------------------
+        // NORMAL URL SITEMAP
+        // ----------------------------------------------------
+
+        for (
+          const pageUrl
+          of locations
         ) {
 
-          urls.add(
-            normalizeUrl(url)
+          if (
+            pages.size >=
+            MAX_PAGES
+          ) {
+            break;
+          }
+
+
+          const normalizedPage =
+            normalizeUrl(
+              pageUrl
+            );
+
+
+          if (!normalizedPage) {
+            continue;
+          }
+
+
+          if (
+            !isHtmlPage(
+              normalizedPage
+            )
+          ) {
+            continue;
+          }
+
+
+          // Only pages belonging to this website.
+          if (
+            !sameOrigin(
+              website,
+              normalizedPage
+            )
+          ) {
+            continue;
+          }
+
+
+          pages.add(
+            normalizedPage
           );
         }
       }
 
 
-      // If this sitemap gave us pages,
-      // don't need other common sitemaps.
-      if (
-        urls.size > 1
-      ) {
-        break;
-      }
-
     } catch {
-      // Ignore.
+
+      sitemapErrors++;
     }
   }
 
 
-  // ----------------------------------------------------------
-  // robots.txt only if sitemap gave nothing
-  // ----------------------------------------------------------
+  return {
 
-  if (
-    urls.size <= 1
-  ) {
+    pages:
+      Array.from(pages),
 
-    try {
+    sitemaps_checked:
+      checkedSitemaps.size,
 
-      const response =
-        await fetch(
-          `${origin}/robots.txt`
-        );
-
-
-      if (response.ok) {
-
-        const robots =
-          await response.text();
-
-
-        const sitemapMatches =
-          robots.match(
-            /^sitemap\s*:\s*(.+)$/gim
-          ) || [];
-
-
-        for (
-          const line
-          of sitemapMatches
-        ) {
-
-          const sitemap =
-            line
-              .replace(
-                /^sitemap\s*:\s*/i,
-                ""
-              )
-              .trim();
-
-
-          try {
-
-            const response2 =
-              await fetch(
-                sitemap
-              );
-
-
-            if (!response2.ok) {
-              continue;
-            }
-
-
-            const xml =
-              await response2.text();
-
-
-            const locations =
-              extractLocs(xml);
-
-
-            for (
-              const url
-              of locations
-            ) {
-
-              if (
-                isHtmlPage(url)
-              ) {
-
-                urls.add(
-                  normalizeUrl(url)
-                );
-              }
-            }
-
-          } catch {
-            // Ignore.
-          }
-        }
-      }
-
-    } catch {
-      // Ignore.
-    }
-  }
-
-
-  return Array.from(urls);
+    sitemap_errors:
+      sitemapErrors
+  };
 }
 
 
 // ============================================================
-// EXTRACT SITEMAP LOCATIONS
+// EXTRACT SITEMAP URLS FROM robots.txt
 // ============================================================
 
-function extractLocs(xml) {
+function extractSitemapUrls(
+  robots
+) {
+
+  const output = [];
+
+
+  const lines =
+    String(
+      robots || ""
+    ).split(/\r?\n/);
+
+
+  for (
+    const line
+    of lines
+  ) {
+
+    const match =
+      line.match(
+        /^\s*sitemap\s*:\s*(.+?)\s*$/i
+      );
+
+
+    if (!match) {
+      continue;
+    }
+
+
+    const url =
+      normalizeUrl(
+        match[1]
+      );
+
+
+    if (url) {
+
+      output.push(
+        url
+      );
+    }
+  }
+
+
+  return output;
+}
+
+
+// ============================================================
+// EXTRACT <loc> FROM XML
+// ============================================================
+
+function extractLocs(
+  xml
+) {
 
   const output = [];
 
@@ -691,17 +914,21 @@ function extractLocs(xml) {
 
 
   while (
-    (match = regex.exec(xml))
+    (match =
+      regex.exec(xml))
   ) {
 
-    const url =
-      decodeEntities(
+    const value =
+      decodeHtmlEntities(
         match[1]
       ).trim();
 
 
-    if (url) {
-      output.push(url);
+    if (value) {
+
+      output.push(
+        value
+      );
     }
   }
 
@@ -711,70 +938,31 @@ function extractLocs(xml) {
 
 
 // ============================================================
-// HTML PAGE CHECK
+// CHECK SAME WEBSITE
 // ============================================================
 
-function isHtmlPage(value) {
+function sameOrigin(
+  website,
+  page
+) {
 
   try {
 
-    const url =
-      new URL(value);
+    const websiteUrl =
+      new URL(
+        website
+      );
 
 
-    const path =
-      url.pathname.toLowerCase();
-
-
-    const blockedExtensions = [
-
-      ".xml",
-      ".json",
-      ".txt",
-
-      ".jpg",
-      ".jpeg",
-      ".png",
-      ".gif",
-      ".webp",
-      ".svg",
-      ".ico",
-
-      ".pdf",
-      ".zip",
-      ".rar",
-
-      ".mp3",
-      ".mp4",
-      ".mov",
-      ".avi",
-
-      ".css",
-      ".js",
-
-      ".woff",
-      ".woff2",
-      ".ttf",
-      ".eot"
-    ];
-
-
-    for (
-      const extension
-      of blockedExtensions
-    ) {
-
-      if (
-        path.endsWith(extension)
-      ) {
-        return false;
-      }
-    }
+    const pageUrl =
+      new URL(
+        page
+      );
 
 
     return (
-      url.protocol === "http:" ||
-      url.protocol === "https:"
+      websiteUrl.origin ===
+      pageUrl.origin
     );
 
   } catch {
@@ -785,10 +973,132 @@ function isHtmlPage(value) {
 
 
 // ============================================================
-// FETCH HTML
+// CHECK WHETHER URL IS AN HTML PAGE
 // ============================================================
 
-async function fetchHtml(url) {
+function isHtmlPage(
+  value
+) {
+
+  try {
+
+    const url =
+      new URL(
+        value
+      );
+
+
+    if (
+      url.protocol !== "http:" &&
+      url.protocol !== "https:"
+    ) {
+
+      return false;
+    }
+
+
+    const path =
+      url.pathname.toLowerCase();
+
+
+    // --------------------------------------------------------
+    // Files that are definitely NOT HTML pages.
+    // --------------------------------------------------------
+
+    const blockedExtensions = [
+
+      // Data
+      ".xml",
+      ".json",
+      ".csv",
+      ".txt",
+
+      // Images
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".gif",
+      ".webp",
+      ".svg",
+      ".ico",
+      ".bmp",
+      ".tiff",
+
+      // Documents
+      ".pdf",
+      ".doc",
+      ".docx",
+      ".xls",
+      ".xlsx",
+      ".ppt",
+      ".pptx",
+
+      // Archives
+      ".zip",
+      ".rar",
+      ".7z",
+      ".tar",
+      ".gz",
+
+      // Video
+      ".mp4",
+      ".webm",
+      ".mov",
+      ".avi",
+      ".mkv",
+
+      // Audio
+      ".mp3",
+      ".wav",
+      ".ogg",
+      ".m4a",
+
+      // Code/assets
+      ".js",
+      ".css",
+      ".map",
+
+      // Fonts
+      ".woff",
+      ".woff2",
+      ".ttf",
+      ".otf",
+      ".eot"
+    ];
+
+
+    for (
+      const extension
+      of blockedExtensions
+    ) {
+
+      if (
+        path.endsWith(
+          extension
+        )
+      ) {
+
+        return false;
+      }
+    }
+
+
+    return true;
+
+  } catch {
+
+    return false;
+  }
+}
+
+
+// ============================================================
+// FETCH WITH TIMEOUT
+// ============================================================
+
+async function fetchWithTimeout(
+  url
+) {
 
   const controller =
     new AbortController();
@@ -796,103 +1106,306 @@ async function fetchHtml(url) {
 
   const timer =
     setTimeout(
-      () => controller.abort(),
+      () => {
+        controller.abort();
+      },
       FETCH_TIMEOUT
     );
 
 
   try {
 
-    const response =
-      await fetch(
-        url,
-        {
+    return await fetch(
+      url,
+      {
 
-          headers: {
+        headers: {
 
-            "User-Agent":
-              "ReportliAI/1.0",
+          "User-Agent":
+            "ReportliAI-WebsiteCrawler/1.0",
 
-            "Accept":
-              "text/html,application/xhtml+xml"
-          },
+          "Accept":
+            "text/html,application/xhtml+xml,application/xml,text/xml,text/plain"
 
-          signal:
-            controller.signal
-        }
-      );
+        },
 
-
-    if (!response.ok) {
-
-      throw new Error(
-        `HTTP ${response.status}`
-      );
-    }
-
-
-    const contentType =
-      response.headers.get(
-        "content-type"
-      ) || "";
-
-
-    if (
-      !contentType.includes("text/html") &&
-      !contentType.includes("xhtml")
-    ) {
-
-      throw new Error(
-        `Not HTML: ${contentType}`
-      );
-    }
-
-
-    return await response.text();
+        signal:
+          controller.signal
+      }
+    );
 
   } finally {
 
-    clearTimeout(timer);
+    clearTimeout(
+      timer
+    );
   }
 }
 
 
 // ============================================================
-// EXTRACT READABLE TEXT
+// FETCH HTML PAGE
 // ============================================================
 
-function extractText(html) {
+async function fetchHtml(
+  url
+) {
 
-  let value =
-    String(html || "");
+  const response =
+    await fetchWithTimeout(
+      url
+    );
 
 
-  // Remove useless HTML sections.
-  value =
-    value.replace(
-      /<(script|style|noscript|svg|canvas|iframe|nav|footer|aside|header)[^>]*>[\s\S]*?<\/\1>/gi,
+  if (
+    !response.ok
+  ) {
+
+    throw new Error(
+      `HTTP ${response.status}`
+    );
+  }
+
+
+  const contentType =
+    (
+      response.headers.get(
+        "content-type"
+      ) || ""
+    ).toLowerCase();
+
+
+  // ----------------------------------------------------------
+  // Reject obvious non-HTML content.
+  // ----------------------------------------------------------
+
+  if (
+    contentType &&
+    !contentType.includes(
+      "text/html"
+    ) &&
+    !contentType.includes(
+      "application/xhtml+xml"
+    )
+  ) {
+
+    throw new Error(
+      `Not HTML: ${contentType}`
+    );
+  }
+
+
+  return await response.text();
+}
+
+
+// ============================================================
+// EXTRACT HEADING SECTIONS
+//
+// Example:
+//
+// <h2>Services</h2>
+// <p>Dental implants.</p>
+// <p>Braces.</p>
+//
+// <h3>Dental Implants</h3>
+// <p>Implants information.</p>
+//
+// Produces:
+//
+// {
+//   heading: "Services",
+//   text: "Dental implants. Braces."
+// }
+//
+// {
+//   heading: "Dental Implants",
+//   text: "Implants information."
+// }
+// ============================================================
+
+function extractHeadingSections(
+  html
+) {
+
+  let source =
+    String(
+      html || ""
+    );
+
+
+  // ----------------------------------------------------------
+  // Remove sections that usually contain navigation,
+  // scripts, styles and unrelated page content.
+  // ----------------------------------------------------------
+
+  source =
+    source.replace(
+
+      /<(script|style|noscript|svg|canvas|iframe|nav|footer|aside)[^>]*>[\s\S]*?<\/\1>/gi,
+
       " "
     );
 
 
-  // Title.
-  const titleMatch =
-    value.match(
-      /<title[^>]*>([\s\S]*?)<\/title>/i
+  // ----------------------------------------------------------
+  // Find H1-H6 and text in between.
+  // ----------------------------------------------------------
+
+  const headingRegex =
+    /<(h[1-6])\b[^>]*>([\s\S]*?)<\/\1>/gi;
+
+
+  const matches = [];
+
+
+  let match;
+
+
+  while (
+    (match =
+      headingRegex.exec(source))
+  ) {
+
+    const headingTag =
+      match[1]
+        .toLowerCase();
+
+
+    const headingText =
+      htmlToText(
+        match[2]
+      );
+
+
+    if (!headingText) {
+      continue;
+    }
+
+
+    matches.push({
+
+      level:
+        Number(
+          headingTag.substring(1)
+        ),
+
+      heading:
+        headingText,
+
+      start:
+        match.index,
+
+      end:
+        headingRegex.lastIndex
+    });
+  }
+
+
+  const sections = [];
+
+
+  // ----------------------------------------------------------
+  // For every heading, collect content until the next heading.
+  // ----------------------------------------------------------
+
+  for (
+    let i = 0;
+    i < matches.length;
+    i++
+  ) {
+
+    const current =
+      matches[i];
+
+
+    const next =
+      matches[i + 1];
+
+
+    const contentStart =
+      current.end;
+
+
+    const contentEnd =
+      next
+        ? next.start
+        : source.length;
+
+
+    const rawContent =
+      source.slice(
+        contentStart,
+        contentEnd
+      );
+
+
+    const text =
+      htmlToText(
+        rawContent
+      );
+
+
+    if (!text) {
+      continue;
+    }
+
+
+    sections.push({
+
+      heading:
+        current.heading,
+
+      text
+
+    });
+  }
+
+
+  return sections;
+}
+
+
+// ============================================================
+// CONVERT HTML TO CLEAN TEXT
+// ============================================================
+
+function htmlToText(
+  html
+) {
+
+  let value =
+    String(
+      html || ""
     );
 
 
-  const title =
-    titleMatch
-      ? cleanText(
-          decodeEntities(
-            titleMatch[1]
-          )
-        )
-      : "";
+  // ----------------------------------------------------------
+  // Remove comments
+  // ----------------------------------------------------------
+
+  value =
+    value.replace(
+      /<!--[\s\S]*?-->/g,
+      " "
+    );
 
 
-  // Remove HTML tags.
+  // ----------------------------------------------------------
+  // Convert common block tags to spaces.
+  // ----------------------------------------------------------
+
+  value =
+    value.replace(
+      /<(br|p|div|section|article|li|ul|ol|table|tr|td|th|blockquote|pre|address|figure|figcaption)[^>]*>/gi,
+      " "
+    );
+
+
+  // ----------------------------------------------------------
+  // Remove remaining HTML tags.
+  // ----------------------------------------------------------
+
   value =
     value.replace(
       /<[^>]+>/g,
@@ -900,42 +1413,44 @@ function extractText(html) {
     );
 
 
+  // ----------------------------------------------------------
   // Decode entities.
+  // ----------------------------------------------------------
+
   value =
-    decodeEntities(value);
+    decodeHtmlEntities(
+      value
+    );
 
 
-  // Clean text.
-  const text =
-    cleanText(value);
+  // ----------------------------------------------------------
+  // Normalize whitespace.
+  // ----------------------------------------------------------
+
+  value =
+    value
+      .replace(
+        /\s+/g,
+        " "
+      )
+      .trim();
 
 
-  return {
-    title,
-    text
-  };
+  return value;
 }
 
 
 // ============================================================
-// CLEAN TEXT
+// HTML ENTITY DECODER
 // ============================================================
 
-function cleanText(value) {
+function decodeHtmlEntities(
+  value
+) {
 
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-
-// ============================================================
-// DECODE HTML ENTITIES
-// ============================================================
-
-function decodeEntities(value) {
-
-  return String(value || "")
+  return String(
+    value || ""
+  )
 
     .replace(
       /&nbsp;/gi,
@@ -958,6 +1473,11 @@ function decodeEntities(value) {
     )
 
     .replace(
+      /&apos;/gi,
+      "'"
+    )
+
+    .replace(
       /&lt;/gi,
       "<"
     )
@@ -965,497 +1485,46 @@ function decodeEntities(value) {
     .replace(
       /&gt;/gi,
       ">"
-    );
-}
+    )
 
+    // Decimal entities
+    .replace(
+      /&#(\d+);/g,
+      (_, code) => {
 
-// ============================================================
-// SPLIT TEXT
-// ============================================================
+        try {
 
-function splitText(
-  text,
-  size,
-  overlap
-) {
+          return String.fromCodePoint(
+            Number(code)
+          );
 
-  const value =
-    cleanText(text);
+        } catch {
 
-
-  if (!value) {
-    return [];
-  }
-
-
-  if (
-    value.length <= size
-  ) {
-    return [value];
-  }
-
-
-  const chunks = [];
-
-  let start = 0;
-
-
-  while (
-    start < value.length &&
-    chunks.length < 50
-  ) {
-
-    const end =
-      Math.min(
-        start + size,
-        value.length
-      );
-
-
-    chunks.push(
-      value.slice(
-        start,
-        end
-      )
-    );
-
-
-    if (
-      end >= value.length
-    ) {
-      break;
-    }
-
-
-    start =
-      end - overlap;
-  }
-
-
-  return chunks;
-}
-
-
-// ============================================================
-// SARVAM
-// ============================================================
-
-async function askSarvam(
-  env,
-  chunk
-) {
-
-  const prompt = `
-Extract factual business information from this page.
-
-Use specific field names.
-Single value = string.
-Multiple values = array.
-Never guess.
-Never return empty strings, null, or [].
-Skip missing information.
-
-Return:
-{"fields":[{"field":"name","data":"value"}]}
-
-PAGE:
-${chunk}
-`;
-
-
-  try {
-
-    const response =
-      await fetch(
-        "https://api.sarvam.ai/v1/chat/completions",
-        {
-
-          method: "POST",
-
-          headers: {
-
-            "Content-Type":
-              "application/json",
-
-            "api-subscription-key":
-              env.SARVAM_API_KEY
-          },
-
-          body:
-            JSON.stringify({
-
-              model:
-                "sarvam-105b",
-
-              messages: [
-
-                {
-                  role: "system",
-
-                  content:
-                    "Return valid JSON only. Extract facts only."
-                },
-
-                {
-                  role: "user",
-
-                  content:
-                    prompt
-                }
-
-              ],
-
-              temperature:
-                0.1,
-
-              max_tokens:
-                4096,
-
-              reasoning_effort:
-                null,
-
-              response_format: {
-                type: "json_object"
-              }
-            })
+          return "";
         }
-      );
-
-
-    if (!response.ok) {
-
-      const error =
-        await response.text();
-
-
-      return {
-
-        error:
-          `Sarvam ${response.status}: ${error}`,
-
-        fields: []
-      };
-    }
-
-
-    const result =
-      await response.json();
-
-
-    const content =
-      result
-        ?.choices?.[0]
-        ?.message
-        ?.content;
-
-
-    if (!content) {
-
-      return {
-
-        error:
-          "Empty Sarvam response",
-
-        fields: []
-      };
-    }
-
-
-    let parsed;
-
-
-    try {
-
-      parsed =
-        typeof content === "string"
-          ? JSON.parse(content)
-          : content;
-
-    } catch {
-
-      return {
-
-        error:
-          "Invalid Sarvam JSON",
-
-        fields: []
-      };
-    }
-
-
-    const fields =
-      Array.isArray(
-        parsed.fields
-      )
-        ? parsed.fields
-        : [];
-
-
-    return {
-      fields
-    };
-
-
-  } catch (error) {
-
-    return {
-
-      error:
-        error?.message ||
-        String(error),
-
-      fields: []
-    };
-  }
-}
-
-
-// ============================================================
-// CLEAN FIELD NAME
-// ============================================================
-
-function cleanField(value) {
-
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(
-      /[^a-z0-9]+/g,
-      "_"
+      }
     )
+
+    // Hex entities
     .replace(
-      /^_+|_+$/g,
-      ""
-    )
-    .slice(
-      0,
-      100
+      /&#x([0-9a-f]+);/gi,
+      (_, code) => {
+
+        try {
+
+          return String.fromCodePoint(
+            parseInt(
+              code,
+              16
+            )
+          );
+
+        } catch {
+
+          return "";
+        }
+      }
     );
-}
-
-
-// ============================================================
-// CLEAN DATA
-// ============================================================
-
-function cleanData(value) {
-
-  if (
-    value === null ||
-    value === undefined
-  ) {
-    return null;
-  }
-
-
-  if (
-    typeof value === "string"
-  ) {
-
-    const result =
-      cleanText(value);
-
-
-    return result
-      ? result
-      : null;
-  }
-
-
-  if (
-    Array.isArray(value)
-  ) {
-
-    const result =
-      value.filter(
-        item =>
-          item !== null &&
-          item !== undefined &&
-          item !== ""
-      );
-
-
-    return result.length
-      ? result
-      : null;
-  }
-
-
-  if (
-    typeof value === "object"
-  ) {
-
-    return Object.keys(value).length
-      ? value
-      : null;
-  }
-
-
-  return value;
-}
-
-
-// ============================================================
-// USEFUL DATA
-// ============================================================
-
-function useful(value) {
-
-  if (
-    value === null ||
-    value === undefined
-  ) {
-    return false;
-  }
-
-
-  if (
-    typeof value === "string"
-  ) {
-
-    return (
-      value.trim().length > 0
-    );
-  }
-
-
-  if (
-    Array.isArray(value)
-  ) {
-
-    return value.length > 0;
-  }
-
-
-  if (
-    typeof value === "object"
-  ) {
-
-    return (
-      Object.keys(value).length > 0
-    );
-  }
-
-
-  return true;
-}
-
-
-// ============================================================
-// MERGE
-// ============================================================
-
-function merge(
-  oldValue,
-  newValue
-) {
-
-  if (!useful(oldValue)) {
-    return newValue;
-  }
-
-
-  if (!useful(newValue)) {
-    return oldValue;
-  }
-
-
-  if (
-    Array.isArray(oldValue) &&
-    Array.isArray(newValue)
-  ) {
-
-    return unique([
-      ...oldValue,
-      ...newValue
-    ]);
-  }
-
-
-  if (
-    Array.isArray(oldValue)
-  ) {
-
-    return unique([
-      ...oldValue,
-      newValue
-    ]);
-  }
-
-
-  if (
-    Array.isArray(newValue)
-  ) {
-
-    return unique([
-      oldValue,
-      ...newValue
-    ]);
-  }
-
-
-  if (
-    typeof oldValue === "object" &&
-    typeof newValue === "object"
-  ) {
-
-    return {
-      ...oldValue,
-      ...newValue
-    };
-  }
-
-
-  if (
-    String(oldValue) !==
-    String(newValue)
-  ) {
-
-    return unique([
-      oldValue,
-      newValue
-    ]);
-  }
-
-
-  return oldValue;
-}
-
-
-// ============================================================
-// UNIQUE VALUES
-// ============================================================
-
-function unique(values) {
-
-  const output = [];
-  const seen = new Set();
-
-
-  for (
-    const value
-    of values
-  ) {
-
-    const key =
-      typeof value === "object"
-        ? JSON.stringify(value)
-        : String(value);
-
-
-    if (
-      seen.has(key)
-    ) {
-      continue;
-    }
-
-
-    seen.add(key);
-    output.push(value);
-  }
-
-
-  return output;
 }
 
 
@@ -1470,9 +1539,46 @@ async function saveRows(
 
   try {
 
+    if (
+      !env.SUPABASE_URL
+    ) {
+
+      return {
+
+        success: false,
+
+        error:
+          "SUPABASE_URL secret is missing"
+      };
+    }
+
+
+    if (
+      !env.SUPABASE_SECRET_KEY
+    ) {
+
+      return {
+
+        success: false,
+
+        error:
+          "SUPABASE_SECRET_KEY secret is missing"
+      };
+    }
+
+
+    // --------------------------------------------------------
+    // IMPORTANT:
+    //
+    // Your business_data table should have:
+    //
+    // UNIQUE(application_id, source_url, field)
+    //
+    // --------------------------------------------------------
+
     const endpoint =
       `${env.SUPABASE_URL}/rest/v1/business_data` +
-      "?on_conflict=application_id,source_url,field";
+      `?on_conflict=application_id,source_url,field`;
 
 
     const response =
@@ -1480,7 +1586,8 @@ async function saveRows(
         endpoint,
         {
 
-          method: "POST",
+          method:
+            "POST",
 
           headers: {
 
@@ -1498,12 +1605,16 @@ async function saveRows(
           },
 
           body:
-            JSON.stringify(rows)
+            JSON.stringify(
+              rows
+            )
         }
       );
 
 
-    if (!response.ok) {
+    if (
+      !response.ok
+    ) {
 
       const error =
         await response.text();
@@ -1520,7 +1631,9 @@ async function saveRows(
 
 
     return {
+
       success: true
+
     };
 
 
@@ -1562,8 +1675,12 @@ function json(
       headers: {
 
         "Content-Type":
-          "application/json; charset=utf-8"
+          "application/json; charset=utf-8",
+
+        "Cache-Control":
+          "no-store"
+
       }
     }
   );
-            }
+  }
